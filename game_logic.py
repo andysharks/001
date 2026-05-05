@@ -1,0 +1,921 @@
+import copy
+import math
+import random
+
+SHIP_TEMPLATES = {
+    "Cruiser": {
+        "cost": 2.0, "movement": 0.0, "max_health": 6.0, "damage": 2.0, "range": 1.0, "aircraft_storage": 4.0
+    },
+    "Light Cruiser": {
+        "cost": 2.0, "movement": 2.0, "max_health": 3.0, "damage": 1.0, "range": 1.0, "aircraft_storage": 2.0, "fleet_movement": 2.0
+    },
+    "Fighter": {
+        "cost": 0.5, "movement": 1.0, "max_health": 0.25, "damage": 0.25, "range": 0.0, "aircraft_storage": 0.0
+    },
+    "Bomber": {
+        "cost": 0.5, "movement": 1.0, "max_health": 0.25, "damage": 0.5, "range": 0.0, "aircraft_storage": 0.0
+    },
+    "Aircraft Carrier": {
+        "cost": 3.0, "movement": 0.0, "max_health": 4.0, "damage": 0.0, "range": 0.0, "aircraft_storage": 16.0
+    },
+    "Dreadnaught": {
+        "cost": 3.0, "movement": 0.0, "max_health": 4.0, "damage": 4.0, "range": 1.0, "aircraft_storage": 4.0,
+        "damage_profile": (4.0, 2.0), "range_profile": (1.0, 2.0)
+    },
+    "Heavy Cruiser": {
+        "cost": 3.0, "movement": 0.0, "max_health": 7.0, "damage": 2.0, "range": 0.0, "aircraft_storage": 4.0
+    },
+    "Super Star Destroyer": {
+        "cost": 5.0, "movement": 1.0, "max_health": 12.0, "damage": 6.0, "range": 1.0, "aircraft_storage": 4.0
+    },
+    "Destroyer": {
+        "cost": 1.0, "movement": 1.0, "max_health": 1.0, "damage": 1.0, "range": 1.0, "aircraft_storage": 2.0
+    },
+    "Light Destroyer": {
+        "cost": 0.5, "movement": 2.0, "max_health": 0.5, "damage": 0.5, "range": 1.0, "aircraft_storage": 1.0, "fleet_movement": 2.0
+    },
+    "Base": {
+        "cost": 0.0, "movement": 0.0, "max_health": 2.0, "damage": 0.0, "range": 0.0, "aircraft_storage": 0.0
+    },
+}
+
+LIGHT_SHIP_TYPES = frozenset({"Light Cruiser", "Light Destroyer"})
+DESTROYER_TYPES = frozenset({"Destroyer", "Light Destroyer"})
+
+SHIP_TYPE_IDS = {
+    "Destroyer": 1,
+    "Cruiser": 2,
+    "Dreadnaught": 3,
+    "Aircraft Carrier": 4,
+    "Heavy Cruiser": 5,
+    "Light Cruiser": 6,
+    "Fighter": 7,
+    "Bomber": 8,
+    "Super Star Destroyer": 9,
+    "Light Destroyer": 10,
+}
+# Display on map for bases uses scrap count, not ship_type_id.
+
+BUILD_MENU_ORDER = [
+    "Destroyer", "Cruiser", "Dreadnaught", "Aircraft Carrier", "Heavy Cruiser",
+    "Light Cruiser", "Fighter", "Bomber", "Super Star Destroyer", "Light Destroyer",
+]
+SCENARIO_POOL = [
+    "Destroyer", "Light Destroyer", "Cruiser", "Light Cruiser",
+    "Aircraft Carrier", "Dreadnaught", "Heavy Cruiser", "Fighter", "Bomber"
+]
+FIGHTER_STRIKE_DAMAGE = SHIP_TEMPLATES["Fighter"]["damage"]
+BOMBER_STRIKE_DAMAGE = SHIP_TEMPLATES["Bomber"]["damage"]
+
+
+def mobile_ships_at(game, x, y, owner):
+    return [
+        s for s in game.all_ships
+        if s.x == x and s.y == y and s.owner == owner
+        and not getattr(s, "is_base", False)
+        and not getattr(s, "is_aircraft_counter", False)
+    ]
+
+
+def fleet_move_budget_for_mobiles(mobiles):
+    if not mobiles:
+        return 0
+    all_light = all(s.ship_type in LIGHT_SHIP_TYPES for s in mobiles)
+    return 2 if all_light else 1
+
+class Ship:
+    def __init__(self, x, y, owner, ship_id, ship_type="Destroyer", aircraft_storage=0, just_built=False):
+        # Constants
+        template = SHIP_TEMPLATES.get(ship_type, SHIP_TEMPLATES["Destroyer"])
+        self.max_health = template["max_health"]
+        self.damage = template["damage"]
+        self.range = template["range"]
+        self.movement = template["movement"]
+        self.fleet_movement = template.get("fleet_movement", 1.0)
+        self.cost = template["cost"]
+        self.aircraft_storage = aircraft_storage if aircraft_storage != 0 else template["aircraft_storage"]
+        self.ship_type = ship_type
+        self.is_base = ship_type == "Base"
+        self.is_aircraft_counter = ship_type in {"Fighter", "Bomber"}
+        self.ship_type_id = SHIP_TYPE_IDS.get(ship_type, 0)
+        # Aircraft counts for dogfight + UI.
+        # - "Fighter" ships contribute fighters (1)
+        # - "Bomber" ships contribute bombers (1)
+        # - Other aircraft-capable ships contribute all storage as fighters (bombers default 0).
+        self.fighters = 0
+        self.bombers = 0
+        if ship_type == "Fighter":
+            self.fighters = 1
+        elif ship_type == "Bomber":
+            self.bombers = 1
+        else:
+            # Default mixed loadout for storage ships so both counters are usable.
+            # Users can later rebalance loadout through future hangar UI.
+            capacity = int(round(self.aircraft_storage))
+            self.fighters = math.ceil(capacity / 2)
+            self.bombers = capacity - self.fighters
+        self.damage_profile = template.get("damage_profile", (self.damage,))
+        self.range_profile = template.get("range_profile", (self.range,))
+        self.scrap = 0
+        self.just_built = just_built
+        self.move_budget_remaining = 1
+        self.did_move_this_turn = False
+        
+        # Variables
+        self.x = x
+        self.y = y
+        self.start_x = x
+        self.start_y = y
+        self.owner = owner
+        self.id = ship_id
+        self.hp = self.max_health
+        self.fleet_num = 1
+        self.start_fleet_num = 1
+        
+        # Status Booleans
+        self.has_fired = False
+        self.has_moved = False
+        self.is_selected = False
+        self.is_enemy_selected = False
+        self.is_reorganizing = False
+        self.is_fleeted = False
+        self.is_turn = False
+        self.is_charging = False
+        self.is_charged = False
+        self.charge_turns = 0
+        self.did_dogfight_this_turn = False
+        self.fighters_used_this_turn = 0
+        self.bombers_used_this_turn = 0
+        self.pending_bomber_strikes = 0
+        self.pending_fighter_strikes = 0
+        self.pending_air_center = None
+        self.shots = 1 if not just_built else 0
+        if just_built:
+            self.has_fired = True
+
+        self.fleet_list = []
+
+class GameState:
+    def __init__(self):
+        self.board_size = 10
+        self.tuning_mode = False
+        self.tuning_seed = 1337
+        self.all_ships = []
+        self.planets = []
+        self.active_player = 1
+        self.state_history = []
+        self.action_log = []
+        self.build_menu_open = False
+        self.attack_damage_done_this_turn = False
+        self.setup_board(seed=self.tuning_seed)
+        self.next_ship_id = max((s.id for s in self.all_ships), default=-1) + 1
+        for ship in self.all_ships:
+            ship.is_turn = (ship.owner == self.active_player)
+        self._assign_move_budgets_for_turn_start()
+
+    def setup_board(self, seed=None):
+        if seed is not None:
+            random.seed(seed)
+        self.all_ships = []
+        self.planets = []
+
+        # Spawn 6 planets on top, then mirror to bottom and vertically reflect bottom.
+        for _ in range(6):
+            px, py = random.randint(0, self.board_size - 1), random.randint(0, (self.board_size // 2) - 1)
+            self.planets.append((px, py))
+            bottom_y = (self.board_size - 1) - py
+            mirrored_x = (self.board_size - 1) - px
+            self.planets.append((mirrored_x, bottom_y))
+            
+        # Two sets of 3 ship fleets
+        for i in range(3):
+            ship_type_p1 = "Destroyer" if i < 2 else "Light Destroyer"
+            ship_type_p2 = "Destroyer" if i < 2 else "Light Destroyer"
+            self.all_ships.append(Ship(i+3, 0, 1, i, ship_type=ship_type_p1))
+            self.all_ships.append(Ship(i+3, 9, 2, i+3, ship_type=ship_type_p2))
+
+    def reset_match(self, deterministic=False):
+        self.active_player = 1
+        self.state_history = []
+        self.action_log = []
+        self.build_menu_open = False
+        self.attack_damage_done_this_turn = False
+        self.setup_board(seed=self.tuning_seed if deterministic else None)
+        self.next_ship_id = max((s.id for s in self.all_ships), default=-1) + 1
+        for ship in self.all_ships:
+            ship.is_selected = False
+            ship.is_enemy_selected = False
+            ship.is_turn = (ship.owner == self.active_player)
+            ship.has_moved = False
+            ship.has_fired = False
+            ship.shots = 1
+            ship.did_move_this_turn = False
+            ship.did_dogfight_this_turn = False
+            ship.fighters_used_this_turn = 0
+            ship.bombers_used_this_turn = 0
+            ship.pending_bomber_strikes = 0
+            ship.pending_fighter_strikes = 0
+            ship.pending_air_center = None
+        self._assign_move_budgets_for_turn_start()
+        self.save_state("Start of Turn")
+
+    def toggle_tuning_mode(self):
+        self.tuning_mode = not self.tuning_mode
+        status = "ON" if self.tuning_mode else "OFF"
+        self.action_log = [f"Tuning mode: {status}"]
+
+    def load_tuning_scenario(self, scenario_id):
+        if scenario_id not in (1, 2, 3, 4, 5, 6):
+            return
+        self.active_player = 1
+        self.state_history = []
+        self.action_log = [f"Loaded tuning scenario {scenario_id}"]
+        self.attack_damage_done_this_turn = False
+        self.planets = []
+        self.all_ships = []
+
+        random.seed((self.tuning_seed + scenario_id + random.randint(0, 10000)))
+        if scenario_id == 1:
+            p1_cells = [(4, 4), (4, 4), (4, 5), (5, 5)]
+            p2_cells = [(5, 4), (5, 4), (5, 3), (4, 3)]
+        elif scenario_id == 2:
+            p1_cells = [(3, 5), (3, 5), (4, 5), (4, 4), (5, 5)]
+            p2_cells = [(6, 4), (6, 4), (5, 4), (5, 3), (4, 4)]
+        elif scenario_id == 3:
+            p1_cells = [(3, 4), (3, 4), (3, 5), (4, 5), (4, 4), (5, 5)]
+            p2_cells = [(6, 5), (6, 5), (6, 4), (5, 4), (5, 5), (4, 4)]
+        elif scenario_id == 4:
+            p1_cells = [(2, 4), (2, 4), (3, 4), (3, 5), (4, 5), (4, 4), (5, 5)]
+            p2_cells = [(7, 5), (7, 5), (6, 5), (6, 4), (5, 4), (5, 5), (4, 4)]
+        elif scenario_id == 5:
+            p1_cells = [(3, 3), (3, 3), (3, 4), (4, 4), (4, 5), (5, 5), (5, 4)]
+            p2_cells = [(6, 6), (6, 6), (6, 5), (5, 5), (5, 4), (4, 4), (4, 5)]
+        else:  # scenario 6
+            p1_cells = [(2, 5), (2, 5), (3, 5), (3, 4), (4, 4), (4, 5), (5, 5), (5, 4)]
+            p2_cells = [(7, 4), (7, 4), (6, 4), (6, 5), (5, 5), (5, 4), (4, 4), (4, 5)]
+
+        sid = 0
+        # Ensure each side has a premade destroyer-containing fleet anchor.
+        p1_anchor = p1_cells[0]
+        p2_anchor = p2_cells[0]
+        self.all_ships.append(Ship(p1_anchor[0], p1_anchor[1], 1, sid, ship_type="Destroyer"))
+        sid += 1
+        self.all_ships.append(Ship(p2_anchor[0], p2_anchor[1], 2, sid, ship_type="Destroyer"))
+        sid += 1
+
+        # Random bomber amounts per side in tuning scenarios.
+        p1_bombers = random.randint(1, min(3, len(p1_cells)))
+        p2_bombers = random.randint(1, min(3, len(p2_cells)))
+        p1_cells_bomber = p1_cells[:p1_bombers]
+        p2_cells_bomber = p2_cells[:p2_bombers]
+        p1_cells_rest = p1_cells[p1_bombers:]
+        p2_cells_rest = p2_cells[p2_bombers:]
+
+        for pos in p1_cells_bomber:
+            self.all_ships.append(Ship(pos[0], pos[1], 1, sid, ship_type="Bomber"))
+            sid += 1
+        for pos in p2_cells_bomber:
+            self.all_ships.append(Ship(pos[0], pos[1], 2, sid, ship_type="Bomber"))
+            sid += 1
+        for pos in p1_cells_rest:
+            st = random.choice(SCENARIO_POOL)
+            self.all_ships.append(Ship(pos[0], pos[1], 1, sid, ship_type=st))
+            sid += 1
+        for pos in p2_cells_rest:
+            st = random.choice(SCENARIO_POOL)
+            self.all_ships.append(Ship(pos[0], pos[1], 2, sid, ship_type=st))
+            sid += 1
+
+        for ship in self.all_ships:
+            ship.is_selected = False
+            ship.is_enemy_selected = False
+            ship.is_turn = (ship.owner == self.active_player)
+            ship.has_moved = False
+            ship.has_fired = False
+            ship.shots = 1
+            ship.did_move_this_turn = False
+            ship.did_dogfight_this_turn = False
+            ship.fighters_used_this_turn = 0
+            ship.bombers_used_this_turn = 0
+            ship.pending_bomber_strikes = 0
+            ship.pending_fighter_strikes = 0
+            ship.pending_air_center = None
+        self.next_ship_id = max((s.id for s in self.all_ships), default=-1) + 1
+        self.build_menu_open = False
+        self._assign_move_budgets_for_turn_start()
+        self.save_state("Start of Turn")
+
+    def _assign_move_budgets_for_turn_start(self):
+        for ship in self.all_ships:
+            ship.did_move_this_turn = False
+            if getattr(ship, "is_base", False):
+                ship.move_budget_remaining = 0
+        seen_cell = set()
+        for anchor in self.all_ships:
+            if getattr(anchor, "is_base", False):
+                continue
+            k = (anchor.x, anchor.y, anchor.owner)
+            if k in seen_cell:
+                continue
+            seen_cell.add(k)
+            mobiles = mobile_ships_at(self, anchor.x, anchor.y, anchor.owner)
+            budget = fleet_move_budget_for_mobiles(mobiles)
+            for mobile in mobiles:
+                mobile.move_budget_remaining = budget
+
+    def base_at(self, x, y):
+        for s in self.all_ships:
+            if getattr(s, "is_base", False) and s.x == x and s.y == y:
+                return s
+        return None
+
+    def try_spawn_base_on_planet(self, ship):
+        if getattr(ship, "is_base", False):
+            return
+        pos = (ship.x, ship.y)
+        if pos not in self.planets:
+            return
+        if self.base_at(ship.x, ship.y) is not None:
+            return
+        nid = self.next_ship_id
+        self.next_ship_id += 1
+        base_ship = Ship(ship.x, ship.y, ship.owner, nid, ship_type="Base")
+        self.all_ships.append(base_ship)
+        self.action_log.append(f"Base established at ({ship.x},{ship.y}) for P{ship.owner}")
+
+    def _dogfight_tiles(self, x, y):
+        # 4-neighborhood + center.
+        tiles = [(x, y)]
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.board_size and 0 <= ny < self.board_size:
+                tiles.append((nx, ny))
+        return tiles
+
+    def _is_in_dogfight_space(self, center, ship):
+        cx, cy = center
+        return abs(ship.x - cx) + abs(ship.y - cy) <= 1
+
+    def _available_fighters(self, ship):
+        return max(0, getattr(ship, "fighters", 0) - getattr(ship, "fighters_used_this_turn", 0))
+
+    def _available_bombers(self, ship):
+        return max(0, getattr(ship, "bombers", 0) - getattr(ship, "bombers_used_this_turn", 0))
+
+    def _mark_attackers_used(self, ships):
+        for ship in ships:
+            ship.fighters_used_this_turn += self._available_fighters(ship)
+            ship.bombers_used_this_turn += self._available_bombers(ship)
+
+    def _mark_defender_fighters_used(self, ships, fighters_to_use):
+        remaining = fighters_to_use
+        for ship in sorted(ships, key=lambda s: s.id):
+            if remaining <= 0:
+                break
+            usable = min(self._available_fighters(ship), remaining)
+            ship.fighters_used_this_turn += usable
+            remaining -= usable
+
+    def _resolve_air_dogfight(self, attacker, target_ship):
+        tx, ty = target_ship.x, target_ship.y
+        zone_tiles = set(self._dogfight_tiles(tx, ty))
+
+        friends = [
+            s for s in self.all_ships
+            if s.owner == attacker.owner
+            and not getattr(s, "is_base", False)
+            and (s.x, s.y) in zone_tiles
+        ]
+        enemies = [
+            s for s in self.all_ships
+            if s.owner != attacker.owner
+            and not getattr(s, "is_base", False)
+            and (s.x, s.y) in zone_tiles
+        ]
+
+        a_f = sum(self._available_fighters(s) for s in friends)
+        a_b = sum(self._available_bombers(s) for s in friends)
+        d_f = sum(self._available_fighters(s) for s in enemies)
+
+        fighter_repels = min(a_f, d_f)
+        surviving_fighters = a_f - fighter_repels
+        bomber_repels = min(a_b, d_f - fighter_repels)
+        surviving_bombers = a_b - bomber_repels
+
+        damage = (
+            surviving_fighters * FIGHTER_STRIKE_DAMAGE
+            + surviving_bombers * BOMBER_STRIKE_DAMAGE
+        )
+        self._mark_attackers_used(friends)
+        self._mark_defender_fighters_used(enemies, fighter_repels + bomber_repels)
+        attacker.pending_bomber_strikes = surviving_bombers
+        attacker.pending_fighter_strikes = surviving_fighters
+        attacker.pending_air_center = (tx, ty)
+
+        def fmt(v):
+            if isinstance(v, (int, float)) and float(v).is_integer():
+                return str(int(v))
+            return f"{v:.2f}".rstrip("0").rstrip(".")
+
+        self.action_log.append(
+            f"Dogfight: F{fmt(a_f)} B{fmt(a_b)} vs F{fmt(d_f)}; "
+            f"repelled F{fmt(fighter_repels)}+B{fmt(bomber_repels)}; "
+            f"damage {fmt(damage)}"
+        )
+
+    def _has_aircraft_in_zone(self, owner, center):
+        cx, cy = center
+        for s in self.all_ships:
+            if s.owner != owner or getattr(s, "is_base", False):
+                continue
+            if abs(s.x - cx) + abs(s.y - cy) <= 1 and (self._available_fighters(s) + self._available_bombers(s)) > 0:
+                return True
+        return False
+
+    def save_state(self, tag):
+        # Deep copy all ships and active player
+        snapshot = {
+            "tag": tag,
+            "ships": copy.deepcopy(self.all_ships),
+            "active_player": self.active_player
+        }
+        self.state_history.append(snapshot)
+
+    def reset_to_turn_start(self):
+        # RRR logic: find last 'Start of Turn'
+        for state in reversed(self.state_history):
+            if state["tag"] == "Start of Turn":
+                self.all_ships = copy.deepcopy(state["ships"])
+                self.active_player = state["active_player"]
+                self.attack_damage_done_this_turn = False
+                self.action_log = ["Turn reset to start state."]
+                break
+
+    def undo_last_action(self):
+        # R logic: pop last snapshot
+        if len(self.state_history) > 1:
+            state = self.state_history.pop()
+            self.all_ships = copy.deepcopy(state["ships"])
+            self.active_player = state["active_player"]
+
+    def switch_turns(self):
+        # Resolve charge progress for current player's ending turn.
+        for s in self.all_ships:
+            if s.owner != self.active_player:
+                continue
+            if s.is_charging:
+                if s.has_moved or s.has_fired:
+                    s.is_charging = False
+                    s.is_charged = False
+                    s.charge_turns = 0
+                else:
+                    s.charge_turns += 1
+                    if s.charge_turns >= 1:
+                        s.is_charged = True
+                        s.is_charging = False
+
+        # X switches turns, changes active player, unselects ships
+        self.active_player = 2 if self.active_player == 1 else 1
+        self.attack_damage_done_this_turn = False
+        for s in self.all_ships:
+            if getattr(s, "is_base", False) and s.owner == self.active_player:
+                s.scrap += 1
+            if s.owner == self.active_player:
+                s.just_built = False
+            s.is_selected = False
+            s.is_enemy_selected = False
+            s.is_turn = (s.owner == self.active_player)
+            if s.is_charging:
+                s.is_charged = True
+                s.is_charging = False
+            s.has_moved = False
+            s.has_fired = False
+            s.shots = 1
+            s.did_move_this_turn = False
+            s.did_dogfight_this_turn = False
+            s.fighters_used_this_turn = 0
+            s.bombers_used_this_turn = 0
+            s.pending_bomber_strikes = 0
+            s.pending_fighter_strikes = 0
+            s.pending_air_center = None
+            s.start_x, s.start_y = s.x, s.y
+        self.build_menu_open = False
+        self._assign_move_budgets_for_turn_start()
+        self.save_state("Start of Turn")
+
+    def handle_c_press(self, ship):
+        """Charge / hyperdrive key behavior:
+        - If charged: arm hyperdrive.
+        - Else: start charging (must end turn without move/fire).
+        """
+        if ship.owner != self.active_player or getattr(ship, "is_base", False):
+            self.action_log = ["Cannot charge this selection."]
+            return False
+        if ship.is_charged:
+            self.action_log = ["Hyperdrive ready: press WASD to jump up to 8 spaces."]
+            return True
+        if ship.is_charging:
+            self.action_log = ["Already charging; end turn without moving/firing."]
+            return False
+        ship.is_charging = True
+        ship.is_charged = False
+        ship.charge_turns = 0
+        self.action_log = ["Charging started. End turn without movement/fire; next turn WASD will hyperdrive."]
+        return False
+
+    def select_ship_at(self, x, y, is_enemy_click):
+        if x < 0 or y < 0 or x >= self.board_size or y >= self.board_size:
+            return
+
+        # Mouse click logic
+        target_owner = 2 if self.active_player == 1 else 1
+        if not is_enemy_click: target_owner = self.active_player
+        
+        for ship in self.all_ships:
+            if is_enemy_click: ship.is_enemy_selected = False
+            else: ship.is_selected = False
+
+        candidates = [
+            s for s in self.all_ships
+            if s.x == x and s.y == y and s.owner == target_owner and not getattr(s, "is_aircraft_counter", False)
+        ]
+        if not candidates:
+            return
+        if is_enemy_click:
+            prio = lambda s: (1 if getattr(s, "is_base", False) else 0, s.id)
+            pick = sorted(candidates, key=prio)[0]
+            pick.is_enemy_selected = True
+        else:
+            bases = [s for s in candidates if getattr(s, "is_base", False)]
+            mobiles = [s for s in candidates if not getattr(s, "is_base", False)]
+            pick = mobiles[0] if mobiles else bases[0]
+            pick.is_selected = True
+
+    def handle_space_click(self, x, y):
+        """Click behavior for mixed stacks:
+        1) first click picks friendly stack ship
+        2) click same space again sets enemy_selected if enemy stack exists
+        """
+        if x < 0 or y < 0 or x >= self.board_size or y >= self.board_size:
+            return
+        friendly = [
+            s for s in self.all_ships
+            if s.x == x and s.y == y and s.owner == self.active_player and not getattr(s, "is_aircraft_counter", False)
+        ]
+        enemy_owner = 2 if self.active_player == 1 else 1
+        enemies = [
+            s for s in self.all_ships
+            if s.x == x and s.y == y and s.owner == enemy_owner and not getattr(s, "is_aircraft_counter", False)
+        ]
+        selected = next((s for s in self.all_ships if s.is_selected), None)
+
+        if friendly:
+            # Always select friendly on click.
+            self.select_ship_at(x, y, False)
+            # If already selected this same tile and enemies exist, set enemy selected too.
+            if selected and selected.x == x and selected.y == y and enemies:
+                self.select_ship_at(x, y, True)
+            return
+        if enemies:
+            self.select_ship_at(x, y, True)
+
+    def hyperdrive_move(self, ship, key):
+        if ship.owner != self.active_player or getattr(ship, "is_base", False):
+            self.action_log = ["Hyperdrive denied."]
+            return
+        if key not in ['w', 'a', 's', 'd']:
+            return
+        if not ship.is_charged:
+            self.action_log = ["Hyperdrive denied: ship is not charged yet."]
+            return
+        if ship.has_moved or ship.has_fired:
+            self.action_log = ["Hyperdrive denied: ship already acted."]
+            return
+
+        dx, dy = 0, 0
+        if key == 'w':
+            dy = -1
+        if key == 'a':
+            dx = -1
+        if key == 's':
+            dy = 1
+        if key == 'd':
+            dx = 1
+
+        steps = 8
+        ox, oy = ship.x, ship.y
+        for _ in range(steps):
+            nx = max(0, min(self.board_size - 1, ship.x + dx))
+            ny = max(0, min(self.board_size - 1, ship.y + dy))
+            if (nx, ny) == (ship.x, ship.y):
+                break
+            blocker = next((s for s in self.all_ships if s.id != ship.id and s.x == nx and s.y == ny), None)
+            ship.x, ship.y = nx, ny
+            if blocker is not None:
+                break
+
+        moved = (ship.x != ox or ship.y != oy)
+        if moved:
+            ship.has_moved = True
+            ship.did_move_this_turn = True
+            ship.move_budget_remaining = 0
+            ship.is_charged = False
+            ship.is_charging = False
+            ship.charge_turns = 0
+            self.try_spawn_base_on_planet(ship)
+            self.action_log = [f"Hyperdrive: moved to ({ship.x},{ship.y})"]
+        else:
+            self.action_log = ["Hyperdrive blocked by map edge."]
+
+    def toggle_build_menu(self):
+        sel = next((s for s in self.all_ships if s.is_selected), None)
+        if sel and getattr(sel, "is_base", False):
+            self.build_menu_open = not self.build_menu_open
+            status = "open" if self.build_menu_open else "closed"
+            self.action_log = [f"Build menu {status} (scrap: {sel.scrap})"]
+        else:
+            self.build_menu_open = False
+            self.action_log = ["Select a base to open build menu (B)."]
+
+    def try_build_ship(self, slot_index_one_based):
+        if not self.build_menu_open:
+            return
+        base = next((s for s in self.all_ships if s.is_selected and getattr(s, "is_base", False)), None)
+        if not base or base.owner != self.active_player:
+            self.action_log = ["Must select your base to build."]
+            return
+        idx = slot_index_one_based - 1
+        if not (0 <= idx < len(BUILD_MENU_ORDER)):
+            return
+        ship_type = BUILD_MENU_ORDER[idx]
+        cost = SHIP_TEMPLATES[ship_type]["cost"]
+        if base.scrap + 1e-9 < cost:
+            self.action_log = [f"Not enough scrap (need {cost}, have {base.scrap})."]
+            return
+        self.save_state("Pre-Build")
+        base.scrap -= cost
+        new_id = self.next_ship_id
+        self.next_ship_id += 1
+        new_ship = Ship(base.x, base.y, base.owner, new_id, ship_type=ship_type, just_built=True)
+        self.all_ships.append(new_ship)
+        self.action_log = [f"Built {ship_type} at ({base.x},{base.y}); cannot attack until next activation."]
+        self.build_menu_open = False
+        self._assign_move_budgets_for_turn_start()
+
+    def update_stats(self, ship, target_ship, key, prev_key):
+        if ship.owner != self.active_player:
+            self.action_log = [f"Not your turn. Player {self.active_player} acts now."]
+            return
+        if getattr(ship, "is_base", False):
+            self.action_log = ["Base has no movement. Press B for build."]
+            return
+
+        if ship.is_charging and key in ['w', 'a', 's', 'd', 'f']:
+            ship.is_charging = False
+            ship.is_charged = False
+            ship.charge_turns = 0
+            self.action_log = ["Charging interrupted by action."]
+
+        if key in ['w', 'a', 's', 'd']:
+            move_group_early = mobile_ships_at(self, ship.x, ship.y, ship.owner)
+            if not move_group_early or ship not in move_group_early:
+                self.action_log = ["Cannot move selection."]
+                return
+            # Rulebook movement gate:
+            # non-destroyers must be fleeted with a destroyer-class ship to move.
+            has_destroyer_in_stack = any(s.ship_type in DESTROYER_TYPES for s in move_group_early)
+            if ship.ship_type not in DESTROYER_TYPES and not has_destroyer_in_stack:
+                self.action_log = ["Movement denied: non-destroyers must be fleeted with a destroyer."]
+                return
+            pool_early = min(m.move_budget_remaining for m in move_group_early)
+            if pool_early <= 0:
+                self.action_log = ["No move budget remaining."]
+                return
+            dx_early, dy_early = 0, 0
+            if key == 'w':
+                dy_early = -1
+            if key == 'a':
+                dx_early = -1
+            if key == 's':
+                dy_early = 1
+            if key == 'd':
+                dx_early = 1
+            dest_x = max(0, min(self.board_size - 1, ship.x + dx_early))
+            dest_y = max(0, min(self.board_size - 1, ship.y + dy_early))
+            incoming_ids = {s.id for s in move_group_early}
+            destination_friendlies = [
+                s for s in self.all_ships
+                if s.owner == ship.owner
+                and not getattr(s, "is_base", False)
+                and not getattr(s, "is_aircraft_counter", False)
+                and s.id not in incoming_ids
+                and s.x == dest_x and s.y == dest_y
+            ]
+            if self.attack_damage_done_this_turn and destination_friendlies:
+                self.action_log = ["Fleet/defleet locked after first attack damage this turn."]
+                return
+
+        if key == 'f':
+            if getattr(ship, "just_built", False):
+                self.action_log = ["New ships cannot fire until your next activation."]
+                return
+
+        # Trace logic for the lower right UI box
+        self.action_log = []
+        self.action_log.append(f"UpdateStats(Ship {ship.id}, Key: {key})")
+        self.save_state("Pre-Action")
+
+        # Update Fleet List (mobile allies on same tile; bases stay docked)
+        mobiles_here_now = mobile_ships_at(self, ship.x, ship.y, ship.owner)
+        ship.fleet_list = [s for s in mobiles_here_now if s.id != ship.id]
+        ship.is_fleeted = len(ship.fleet_list) > 0
+        for f_ship in ship.fleet_list:
+            f_ship.is_fleeted = True
+        
+        # Determine Reorganization
+        ship.fleet_num = 1 + len(ship.fleet_list)
+        if ship.fleet_num != ship.start_fleet_num:
+            ship.is_reorganizing = True
+            for f_ship in ship.fleet_list: f_ship.is_reorganizing = True
+
+        self.action_log.append(f"isTurn: {ship.is_turn} -> isFleeted: {ship.is_fleeted} -> Reorganizing: {ship.is_reorganizing}")
+
+        # Movement: mobiles move together; light-only stacks budget 2, mixed stacks 1 step/turn pool.
+        if key in ['w', 'a', 's', 'd']:
+            dx, dy = 0, 0
+            if key == 'w':
+                dy = -1
+            if key == 'a':
+                dx = -1
+            if key == 's':
+                dy = 1
+            if key == 'd':
+                dx = 1
+
+            move_group = mobile_ships_at(self, ship.x, ship.y, ship.owner)
+            shared = min(m.move_budget_remaining for m in move_group)
+            for mover in move_group:
+                mover.move_budget_remaining = shared
+
+            old_positions = {s.id: (s.x, s.y) for s in move_group}
+            for moving_ship in move_group:
+                moving_ship.x = max(0, min(self.board_size - 1, moving_ship.x + dx))
+                moving_ship.y = max(0, min(self.board_size - 1, moving_ship.y + dy))
+
+            moved = any(
+                (moving_ship.x, moving_ship.y) != old_positions[moving_ship.id]
+                for moving_ship in move_group
+            )
+            if moved:
+                new_pool = shared - 1
+                remaining = max(0, new_pool)
+                for moving_ship in move_group:
+                    moving_ship.did_move_this_turn = True
+                    moving_ship.move_budget_remaining = remaining
+                    moving_ship.has_moved = remaining <= 0
+                self.action_log.append(
+                    f"Action A: {'Fleet moved' if len(move_group) > 1 else 'Moved'} "
+                    f"{key} (budget left {remaining})"
+                )
+                for moving_ship in move_group:
+                    self.try_spawn_base_on_planet(moving_ship)
+            else:
+                self.action_log.append("Action A: Blocked by map edge")
+
+        # Firing Logic
+        if key == 'f' and target_ship:
+            dist = math.sqrt((ship.x - target_ship.x) ** 2 + (ship.y - target_ship.y) ** 2)
+            ship_range = float(ship.range)
+            aircraft_launch_range = 2.0 if ship_range <= 0.0 else max(1.0, ship_range)
+            in_air_range = dist <= aircraft_launch_range
+            in_hull_range = ship_range > 0.0 and dist <= ship_range
+
+            zone_tiles = set(self._dogfight_tiles(target_ship.x, target_ship.y))
+            attacker_zone = [
+                s for s in self.all_ships
+                if s.owner == ship.owner
+                and not getattr(s, "is_base", False)
+                and (s.x, s.y) in zone_tiles
+            ]
+            attacker_aircraft = sum(
+                self._available_fighters(s) + self._available_bombers(s)
+                for s in attacker_zone
+            )
+            can_dogfight = (
+                not getattr(ship, "did_dogfight_this_turn", False)
+                and in_air_range
+                and attacker_aircraft > 0
+            )
+            pending_aircraft = (
+                getattr(ship, "pending_bomber_strikes", 0)
+                + getattr(ship, "pending_fighter_strikes", 0)
+            )
+            pending_center = getattr(ship, "pending_air_center", None)
+
+            if pending_aircraft > 0:
+                if pending_center is None or not self._is_in_dogfight_space(pending_center, target_ship):
+                    self.action_log.append("Action F: Select an enemy in the active dogfight space")
+                    return
+                if ship.pending_bomber_strikes > 0:
+                    ship.pending_bomber_strikes -= 1
+                    target_ship.hp -= BOMBER_STRIKE_DAMAGE
+                    self.attack_damage_done_this_turn = True
+                    self.action_log.append(f"Air strike: bomber hit ({BOMBER_STRIKE_DAMAGE})")
+                else:
+                    ship.pending_fighter_strikes -= 1
+                    target_ship.hp -= FIGHTER_STRIKE_DAMAGE
+                    self.attack_damage_done_this_turn = True
+                    self.action_log.append(f"Air strike: fighter hit ({FIGHTER_STRIKE_DAMAGE})")
+                if ship.pending_bomber_strikes <= 0 and ship.pending_fighter_strikes <= 0:
+                    ship.pending_air_center = None
+                self.all_ships = [s for s in self.all_ships if s.hp > 0]
+                return
+
+            if can_dogfight:
+                self._resolve_air_dogfight(ship, target_ship)
+                ship.did_dogfight_this_turn = True
+                return
+
+            if in_hull_range and ship.shots > 0:
+                target_ship.hp -= ship.damage
+                self.attack_damage_done_this_turn = True
+                ship.has_fired = True
+                ship.shots -= 1
+                self.action_log.append("Action: Fired at enemy!")
+                self.all_ships = [s for s in self.all_ships if s.hp > 0]
+                return
+
+            if ship.shots <= 0:
+                self.action_log.append("Action F: No shots left this turn")
+            elif attacker_aircraft > 0 and not in_air_range and not in_hull_range:
+                self.action_log.append("Action F: Target out of range")
+            elif ship_range <= 0 and attacker_aircraft == 0:
+                self.action_log.append("Ship cannot fire (no aircraft, no guns).")
+            else:
+                self.action_log.append("Action F: Target out of range")
+
+        # Charge Logic
+        if key == 'c' and not ship.is_charging:
+            ship.is_charging = True
+            for s in ship.fleet_list: s.is_charging = True
+            self.action_log.append("Action C: Charging")
+            
+        # Clean up dead ships
+        self.all_ships = [s for s in self.all_ships if s.hp > 0]
+
+    def break_fleet_move(self, ship, key):
+        if ship.owner != self.active_player:
+            self.action_log = [f"Not your turn. Player {self.active_player} acts now."]
+            return
+        if getattr(ship, "is_base", False):
+            self.action_log.append("Bases cannot use V-move.")
+            return
+        if key not in ['w', 'a', 's', 'd']:
+            return
+        if self.attack_damage_done_this_turn:
+            self.action_log = ["Fleet/defleet locked after first attack damage this turn."]
+            return
+
+        mobile_peers = mobile_ships_at(self, ship.x, ship.y, ship.owner)
+        self.action_log = [f"BreakFleetMove(Ship {ship.id}, Key: {key})"]
+        self.save_state("Pre-Action")
+
+        has_destroyer_in_stack = any(s.ship_type in DESTROYER_TYPES for s in mobile_peers)
+        if ship.ship_type not in DESTROYER_TYPES and not has_destroyer_in_stack:
+            self.action_log.append("Action V denied: non-destroyers must fleet with a destroyer to move")
+            return
+
+        # V cannot bypass post-fire / exhausted movement (partial fleet moves still OK).
+        if ship.move_budget_remaining <= 0 or any(m.has_fired for m in mobile_peers):
+            self.action_log.append("Action V denied: no move budget or fleet already attacked")
+            return
+
+        dx, dy = 0, 0
+        if key == 'w':
+            dy = -1
+        if key == 'a':
+            dx = -1
+        if key == 's':
+            dy = 1
+        if key == 'd':
+            dx = 1
+
+        original_x, original_y = ship.x, ship.y
+        ship.x = max(0, min(self.board_size - 1, ship.x + dx))
+        ship.y = max(0, min(self.board_size - 1, ship.y + dy))
+
+        moved = (ship.x != original_x or ship.y != original_y)
+        if moved:
+            ship.did_move_this_turn = True
+            ship.move_budget_remaining = max(0, ship.move_budget_remaining - 1)
+            ship.has_moved = ship.move_budget_remaining <= 0
+            # Defleet action consumes attacks for the entire original stack this turn (mobile ships).
+            for fleet_ship in mobile_peers:
+                fleet_ship.shots = 0
+                fleet_ship.has_fired = True
+                fleet_ship.is_fleeted = False
+            ship.is_fleeted = False
+            self.try_spawn_base_on_planet(ship)
+            self.action_log.append("Action V: Broke fleet and moved single ship (no attacks for that fleet this turn)")
+        else:
+            self.action_log.append("Action V: Blocked by map edge")
