@@ -1,5 +1,6 @@
 import pygame
 import sys
+from game_ai import AIController
 from game_logic import GameState
 from game_graphics import Renderer
 
@@ -7,15 +8,38 @@ def main():
     game = GameState()
     renderer = Renderer()
     clock = pygame.time.Clock()
+    ai = AIController(owner=2)
+    ai_enabled = False
+    ai_step_timer_ms = 0
+    ai_step_delay_ms = 250
     
     prev_key = None
     awaiting_split_move = False
     awaiting_hyperdrive = False
 
     game.reset_match(deterministic=False)
+    game.ai_enabled = ai_enabled
+    game.ai_thinking = False
 
     # Start Main Game Loop (Repeat Forever)
     while True:
+        ai_turn_active = ai_enabled and game.active_player == ai.owner and not game.game_over
+        game.ai_enabled = ai_enabled
+        game.ai_thinking = ai.is_thinking
+
+        if ai_turn_active:
+            if not ai.has_plan():
+                ai.compute_plan(game)
+                game.ai_thinking = ai.is_thinking
+            now = pygame.time.get_ticks()
+            if now - ai_step_timer_ms >= ai_step_delay_ms:
+                still_running = ai.step(game)
+                ai_step_timer_ms = now
+                if not still_running:
+                    ai.clear_plan()
+                    game.switch_turns()
+            ai_turn_active = ai_enabled and game.active_player == ai.owner
+
         # 1. Processing time Input
         # 1. Processing time Input
         for event in pygame.event.get():
@@ -24,6 +48,8 @@ def main():
                 sys.exit()
                 
             if event.type == pygame.MOUSEBUTTONDOWN:
+                if ai_turn_active:
+                    continue
                 if event.button == 1: # Left click
                     # Space mode: map click to board cells.
                     x, y = event.pos[0] // 50, event.pos[1] // 50
@@ -33,32 +59,59 @@ def main():
 
             if event.type == pygame.KEYDOWN:
                 char = event.unicode.lower()
-                
-                if char == 'x':
+
+                if game.game_over and char != 'g':
+                    game.action_log = [f"Game over. Player {game.winner} wins. Press G for new match."]
+                elif char == 'o':
+                    ai_enabled = not ai_enabled
+                    game.ai_enabled = ai_enabled
+                    if not ai_enabled:
+                        ai.clear_plan()
+                        game.ai_thinking = False
+                    game.action_log = [f"AI for P2: {'ON' if ai_enabled else 'OFF'}"]
+                elif char == 'x':
+                    if ai_turn_active:
+                        ai.clear_plan()
                     game.switch_turns()
                     prev_key = None
                     awaiting_split_move = False
                     awaiting_hyperdrive = False
                 elif char == 't':
+                    if ai_turn_active:
+                        continue
                     game.toggle_tuning_mode()
                 elif char == 'g':
+                    ai.clear_plan()
                     game.reset_match(deterministic=game.tuning_mode)
                     prev_key = None
                     awaiting_split_move = False
+                    awaiting_hyperdrive = False
                 elif game.build_menu_open and char in "1234567890":
+                    if ai_turn_active:
+                        continue
                     slot = 10 if char == "0" else int(char)
                     game.try_build_ship(slot)
                 elif char in ['1', '2', '3', '4', '5', '6'] and game.tuning_mode and not game.build_menu_open:
+                    if ai_turn_active:
+                        continue
+                    ai.clear_plan()
                     game.load_tuning_scenario(int(char))
                     prev_key = None
                     awaiting_split_move = False
+                    awaiting_hyperdrive = False
                 elif char == 'b':
+                    if ai_turn_active:
+                        continue
                     game.toggle_build_menu()
                 elif char == 'v':
+                    if ai_turn_active:
+                        continue
                     awaiting_split_move = True
                     awaiting_hyperdrive = False
                     game.action_log = ["V mode armed: press WASD to move only the selected ship and defleet."]
                 elif char == 'c':
+                    if ai_turn_active:
+                        continue
                     awaiting_split_move = False
                     ship = next((s for s in game.all_ships if s.is_selected), None)
                     if ship:
@@ -67,9 +120,11 @@ def main():
                         awaiting_hyperdrive = False
                         game.action_log = [f"Select a Player {game.active_player} ship first."]
                 elif char == 'r':
+                    ai.clear_plan()
                     game.reset_to_turn_start()
-                        
                 elif char == 'm':
+                    if ai_turn_active:
+                        continue
                     # Cycle through Player fleet
                     ship = next((s for s in game.all_ships if s.is_selected), None)
                     if ship:
@@ -83,11 +138,19 @@ def main():
                             fleet[(idx + 1) % len(fleet)].is_selected = True
                             
                 elif char == 'n':
+                    if ai_turn_active:
+                        continue
                     # Cycle through Enemy fleet
                     target = next((s for s in game.all_ships if s.is_enemy_selected), None)
                     if target:
                         fleet = sorted(
-                            [s for s in game.all_ships if s.x == target.x and s.y == target.y and s.owner == target.owner],
+                            [
+                                s for s in game.all_ships
+                                if s.x == target.x
+                                and s.y == target.y
+                                and s.owner == target.owner
+                                and (not getattr(s, "is_base", False) or game.can_target_ship(s))
+                            ],
                             key=lambda v: (1 if getattr(v, "is_base", False) else 0, v.id),
                         )
                         if len(fleet) > 1:
@@ -96,6 +159,8 @@ def main():
                             fleet[(idx + 1) % len(fleet)].is_enemy_selected = True
 
                 elif char in ['w', 'a', 's', 'd', 'f']:
+                    if ai_turn_active:
+                        continue
                     ship = next((s for s in game.all_ships if s.is_selected), None)
                     target = next((s for s in game.all_ships if s.is_enemy_selected), None)
                     if ship:

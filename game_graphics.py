@@ -176,16 +176,35 @@ class Renderer:
                 break
 
         # Controls footer
-        controls = (
-            f"Turn: P{game_state.active_player} | "
-            "WASD move, V+WASD split move, F fire, C charge, M/N cycle stack, R undo, RRR reset turn, X end turn"
-        )
+        if getattr(game_state, "game_over", False):
+            controls = f"GAME OVER | Winner: Player {game_state.winner} | Press G for new match"
+        else:
+            controls = (
+                f"Turn: P{game_state.active_player} | "
+                "WASD move, V+WASD split move, F fire, C charge, M/N cycle stack, O AI toggle, R reset turn, X end turn"
+            )
         self._render_wrapped(controls, (180, 180, 180), 8, 680, 492, self.small_font)
 
         tuning_status = "ON" if game_state.tuning_mode else "OFF"
         tuning_line = f"Tuning: {tuning_status} | T toggle | G new match ({'seeded' if game_state.tuning_mode else 'random'}) | 1/2/3/4/5/6 scenarios"
         tuning_color = (120, 255, 120) if game_state.tuning_mode else (160, 160, 160)
         self._render_wrapped(tuning_line, tuning_color, 8, 664, 492, self.small_font)
+
+        ai_status = "ON" if getattr(game_state, "ai_enabled", False) else "OFF"
+        ai_line = f"AI P2: {ai_status}"
+        if getattr(game_state, "ai_thinking", False):
+            ai_line += " | Thinking..."
+        ai_color = (255, 200, 120) if getattr(game_state, "ai_enabled", False) else (140, 140, 140)
+        self._render_wrapped(ai_line, ai_color, 8, 648, 492, self.small_font)
+
+        if getattr(game_state, "game_over", False):
+            overlay = pygame.Surface((420, 90), pygame.SRCALPHA)
+            overlay.fill((18, 8, 8, 230))
+            self.screen.blit(overlay, (40, 205))
+            title = self.font.render(f"Player {game_state.winner} wins", True, (255, 210, 160))
+            subtitle = self.small_font.render("A base was destroyed. Press G to restart.", True, (240, 240, 240))
+            self.screen.blit(title, (155, 228))
+            self.screen.blit(subtitle, (95, 255))
 
         if getattr(game_state, "build_menu_open", False):
             overlay = pygame.Surface((480, 150), pygame.SRCALPHA)
