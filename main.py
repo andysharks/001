@@ -8,7 +8,7 @@ def main():
     game = GameState()
     renderer = Renderer()
     clock = pygame.time.Clock()
-    ai = AIController(owner=2)
+    ai = AIController(owner=2, depth=4, min_depth=3)
     ai_enabled = False
     ai_step_timer_ms = 0
     ai_step_delay_ms = 250
@@ -23,7 +23,7 @@ def main():
 
     # Start Main Game Loop (Repeat Forever)
     while True:
-        ai_turn_active = ai_enabled and game.active_player == ai.owner and not game.game_over
+        ai_turn_active = ai_enabled and game.active_player == 2 and not game.game_over
         game.ai_enabled = ai_enabled
         game.ai_thinking = ai.is_thinking
 
@@ -38,7 +38,7 @@ def main():
                 if not still_running:
                     ai.clear_plan()
                     game.switch_turns()
-            ai_turn_active = ai_enabled and game.active_player == ai.owner
+            ai_turn_active = ai_enabled and game.active_player == 2
 
         # 1. Processing time Input
         # 1. Processing time Input
@@ -52,8 +52,10 @@ def main():
                     continue
                 if event.button == 1: # Left click
                     # Space mode: map click to board cells.
-                    x, y = event.pos[0] // 50, event.pos[1] // 50
-                    if not (0 <= x < 10 and 0 <= y < 10):
+                    cell = renderer.cell_size
+                    x, y = event.pos[0] // cell, event.pos[1] // cell
+                    bs = game.board_size
+                    if not (0 <= x < bs and 0 <= y < bs):
                         continue
                     game.handle_space_click(x, y)
 
@@ -91,11 +93,15 @@ def main():
                         continue
                     slot = 10 if char == "0" else int(char)
                     game.try_build_ship(slot)
-                elif char in ['1', '2', '3', '4', '5', '6'] and game.tuning_mode and not game.build_menu_open:
+                elif char in ['1', '2', '3', '4', '5', '6', '7'] and game.tuning_mode and not game.build_menu_open:
                     if ai_turn_active:
                         continue
+                    sid = int(char)
                     ai.clear_plan()
-                    game.load_tuning_scenario(int(char))
+                    game.load_tuning_scenario(sid)
+                    if sid == 7:
+                        ai_enabled = True
+                        game.ai_enabled = True
                     prev_key = None
                     awaiting_split_move = False
                     awaiting_hyperdrive = False

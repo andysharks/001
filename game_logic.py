@@ -41,6 +41,28 @@ SHIP_TEMPLATES = {
 
 LIGHT_SHIP_TYPES = frozenset({"Light Cruiser", "Light Destroyer"})
 DESTROYER_TYPES = frozenset({"Destroyer", "Light Destroyer"})
+CAPITAL_SHIP_TYPES = frozenset(
+    {"Cruiser", "Light Cruiser", "Heavy Cruiser", "Aircraft Carrier", "Dreadnaught", "Super Star Destroyer"}
+)
+DREADNAUGHT_EXCLUDED = frozenset({"Cruiser", "Heavy Cruiser", "Aircraft Carrier"})
+MAX_CAPITALS_PER_FLEET = 4
+
+
+def _fleet_rule_violation(stack_after):
+    """Return a string describing the broken rule, or None if the stack is legal.
+
+    `stack_after` is an iterable of mobile-ship objects that would share a
+    tile after the proposed move/build. Bases and aircraft-counter hulls are
+    expected to already be filtered out by the caller.
+    """
+    has_dread = any(s.ship_type == "Dreadnaught" for s in stack_after)
+    has_excluded = any(s.ship_type in DREADNAUGHT_EXCLUDED for s in stack_after)
+    if has_dread and has_excluded:
+        return "Movement denied: Dreadnaught cannot fleet with Cruiser / Heavy Cruiser / Aircraft Carrier."
+    capitals_after = sum(1 for s in stack_after if s.ship_type in CAPITAL_SHIP_TYPES)
+    if capitals_after > MAX_CAPITALS_PER_FLEET:
+        return "Movement denied: max 4 large ships per fleet."
+    return None
 
 SHIP_TYPE_IDS = {
     "Destroyer": 1,
@@ -139,6 +161,19 @@ def _ship_can_threaten(ship):
     return True
 
 
+def _ship_can_threaten_air(ship):
+    """Like _ship_can_threaten, but also allows aircraft-counter (Fighter/Bomber)
+    hull ships. They cannot move themselves and can only contribute to a dogfight
+    when the target is within manhattan <= 1, but they DO project damage that the
+    AI evaluator should account for.
+    """
+    if getattr(ship, "is_base", False):
+        return False
+    if getattr(ship, "just_built", False):
+        return False
+    return True
+
+
 def threat_map_for(game, owner):
     """Approximate damage `owner` can deliver to each square this turn.
 
@@ -185,6 +220,29 @@ def threat_map_for(game, owner):
                     contribution += air_dmg
                 if contribution > 0:
                     threats[(tx, ty)] = threats.get((tx, ty), 0.0) + contribution
+
+    # Second pass: aircraft-counter (Fighter/Bomber) hull ships. They cannot
+    # move themselves; they only contribute to a dogfight when the target is at
+    # manhattan <= 1 from their position (the dogfight zone is the target's
+    # 4-neighborhood + center).
+    for ship in game.all_ships:
+        if ship.owner != owner:
+            continue
+        if not getattr(ship, "is_aircraft_counter", False):
+            continue
+        if not _ship_can_threaten_air(ship):
+            continue
+        air_dmg = _ship_aircraft_strike_damage(ship)
+        if air_dmg <= 0:
+            continue
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                if abs(dx) + abs(dy) > 1:
+                    continue
+                tx, ty = ship.x + dx, ship.y + dy
+                if not (0 <= tx < board_size and 0 <= ty < board_size):
+                    continue
+                threats[(tx, ty)] = threats.get((tx, ty), 0.0) + air_dmg
     return threats
 
 
@@ -210,6 +268,18 @@ def focus_fire_potential(game, target_ship, attackers_owner):
         if hull_range > 0 and dist <= hull_range and getattr(ship, "shots", 0) > 0:
             total += float(getattr(ship, "damage", 0))
         if dist <= air_launch:
+            total += _ship_aircraft_strike_damage(ship)
+
+    # Aircraft-counter friendlies contribute their air strike damage when they
+    # sit inside the target's dogfight zone (manhattan <= 1).
+    for ship in game.all_ships:
+        if ship.owner != attackers_owner:
+            continue
+        if not getattr(ship, "is_aircraft_counter", False):
+            continue
+        if not _ship_can_threaten_air(ship):
+            continue
+        if manhattan_distance((ship.x, ship.y), target_pos) <= 1:
             total += _ship_aircraft_strike_damage(ship)
     return total
 
@@ -438,16 +508,29 @@ def evaluate_board(game_state):
 
     return score
 
+# Hangar buys add +1 fighter/bomber to the ship at this base tile with highest aircraft_storage.
+HANGAR_FIGHTER_KEY = "__HANGAR_FIGHTER__"
+HANGAR_BOMBER_KEY = "__HANGAR_BOMBER__"
+
 BUILD_MENU_ORDER = [
     "Destroyer", "Cruiser", "Dreadnaught", "Aircraft Carrier", "Heavy Cruiser",
-    "Light Cruiser", "Fighter", "Bomber", "Super Star Destroyer", "Light Destroyer",
+    "Light Cruiser",
+    HANGAR_FIGHTER_KEY,
+    HANGAR_BOMBER_KEY,
+    "Super Star Destroyer", "Light Destroyer",
 ]
+
+BUILD_MENU_LABELS = {HANGAR_FIGHTER_KEY: "+1 Fighter (hangar)", HANGAR_BOMBER_KEY: "+1 Bomber (hangar)"}
 SCENARIO_POOL = [
     "Destroyer", "Light Destroyer", "Cruiser", "Light Cruiser",
     "Aircraft Carrier", "Dreadnaught", "Heavy Cruiser", "Fighter", "Bomber"
 ]
 FIGHTER_STRIKE_DAMAGE = SHIP_TEMPLATES["Fighter"]["damage"]
 BOMBER_STRIKE_DAMAGE = SHIP_TEMPLATES["Bomber"]["damage"]
+
+HYPERDRIVE_MAX_STEPS = 8
+_HYPER_KEY_TO_VEC = {"w": (0, -1), "a": (-1, 0), "s": (0, 1), "d": (1, 0)}
+_HYPER_VEC_TO_KEY = {(0, -1): "w", (-1, 0): "a", (0, 1): "s", (1, 0): "d"}
 
 
 def mobile_ships_at(game, x, y, owner):
@@ -457,6 +540,34 @@ def mobile_ships_at(game, x, y, owner):
         and not getattr(s, "is_base", False)
         and not getattr(s, "is_aircraft_counter", False)
     ]
+
+
+def aircraft_carrying_capacity_int(ship):
+    return max(0, int(round(float(getattr(ship, "aircraft_storage", 0.0)))))
+
+
+def aircraft_aircraft_stored_total(ship):
+    return max(0, int(getattr(ship, "fighters", 0)) + int(getattr(ship, "bombers", 0)))
+
+
+def aircraft_hangar_space(ship):
+    return max(0, aircraft_carrying_capacity_int(ship) - aircraft_aircraft_stored_total(ship))
+
+
+def pick_hangar_recipient_at_base(game, base_ship):
+    """Mobile at same tile as base with the most runway storage that can accept one aircraft."""
+    if base_ship is None or not getattr(base_ship, "is_base", False):
+        return None
+    bx, by, owner = base_ship.x, base_ship.y, base_ship.owner
+    candidates = [
+        s for s in game.all_ships
+        if s.owner == owner and s.x == bx and s.y == by and not getattr(s, "is_base", False)
+        and not getattr(s, "is_aircraft_counter", False) and aircraft_carrying_capacity_int(s) >= 1
+        and aircraft_hangar_space(s) >= 1
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda s: (aircraft_carrying_capacity_int(s), s.id))
 
 
 def fleet_move_budget_for_mobiles(mobiles):
@@ -480,22 +591,14 @@ class Ship:
         self.is_base = ship_type == "Base"
         self.is_aircraft_counter = ship_type in {"Fighter", "Bomber"}
         self.ship_type_id = SHIP_TYPE_IDS.get(ship_type, 0)
-        # Aircraft counts for dogfight + UI.
-        # - "Fighter" ships contribute fighters (1)
-        # - "Bomber" ships contribute bombers (1)
-        # - Other aircraft-capable ships contribute all storage as fighters (bombers default 0).
+        # Aircraft: only standalone Fighter/Bomber hull ships start with planes.
+        # Carrier-line hulls have empty hangars; buy +1 Fighter/Bomber at a base (+ highest storage hull).
         self.fighters = 0
         self.bombers = 0
         if ship_type == "Fighter":
             self.fighters = 1
         elif ship_type == "Bomber":
             self.bombers = 1
-        else:
-            # Default mixed loadout for storage ships so both counters are usable.
-            # Users can later rebalance loadout through future hangar UI.
-            capacity = int(round(self.aircraft_storage))
-            self.fighters = math.ceil(capacity / 2)
-            self.bombers = capacity - self.fighters
         self.damage_profile = template.get("damage_profile", (self.damage,))
         self.range_profile = template.get("range_profile", (self.range,))
         self.scrap = 0
@@ -525,7 +628,12 @@ class Ship:
         self.is_charging = False
         self.is_charged = False
         self.charge_turns = 0
+        # Hyperdrive glide: cardinal lock + count (max 8 one-cell hops per charge).
+        self.hyperdrive_dx = None
+        self.hyperdrive_dy = None
+        self.hyperdrive_steps_used = 0
         self.did_dogfight_this_turn = False
+        self.did_hyperdrive_this_turn = False
         self.fighters_used_this_turn = 0
         self.bombers_used_this_turn = 0
         self.pending_bomber_strikes = 0
@@ -540,6 +648,7 @@ class Ship:
 class GameState:
     def __init__(self):
         self.board_size = 10
+        self.ai_vs_ai = False
         self.tuning_mode = False
         self.tuning_seed = 1337
         self.all_ships = []
@@ -572,14 +681,20 @@ class GameState:
             mirrored_x = (self.board_size - 1) - px
             self.planets.append((mirrored_x, bottom_y))
             
-        # Two sets of 3 ship fleets
-        for i in range(3):
-            ship_type_p1 = "Destroyer" if i < 2 else "Light Destroyer"
-            ship_type_p2 = "Destroyer" if i < 2 else "Light Destroyer"
-            self.all_ships.append(Ship(i+3, 0, 1, i, ship_type=ship_type_p1))
-            self.all_ships.append(Ship(i+3, 9, 2, i+3, ship_type=ship_type_p2))
+        # Each side starts as one stacked fleet of Cruiser + 2 Destroyers.
+        p1_anchor = (self.board_size // 2, 0)
+        p2_anchor = (self.board_size // 2, self.board_size - 1)
+        starting_pack = ("Cruiser", "Destroyer", "Destroyer")
+        sid = 0
+        for ship_type in starting_pack:
+            self.all_ships.append(Ship(p1_anchor[0], p1_anchor[1], 1, sid, ship_type=ship_type))
+            sid += 1
+            self.all_ships.append(Ship(p2_anchor[0], p2_anchor[1], 2, sid, ship_type=ship_type))
+            sid += 1
 
     def reset_match(self, deterministic=False):
+        self.board_size = 10
+        self.ai_vs_ai = False
         self.active_player = 1
         self.state_history = []
         self.action_log = []
@@ -599,6 +714,7 @@ class GameState:
             ship.shots = 1
             ship.did_move_this_turn = False
             ship.did_dogfight_this_turn = False
+            ship.did_hyperdrive_this_turn = False
             ship.fighters_used_this_turn = 0
             ship.bombers_used_this_turn = 0
             ship.pending_bomber_strikes = 0
@@ -613,11 +729,15 @@ class GameState:
         self.action_log = [f"Tuning mode: {status}"]
 
     def load_tuning_scenario(self, scenario_id):
-        if scenario_id not in (1, 2, 3, 4, 5, 6):
+        if scenario_id not in (1, 2, 3, 4, 5, 6, 7):
             return
         self.active_player = 1
         self.state_history = []
-        self.action_log = [f"Loaded tuning scenario {scenario_id}"]
+        self.action_log = (
+            [f"Loaded tuning scenario {scenario_id} — 5x5 vs AI P2, 3 planets (you are P1)"]
+            if scenario_id == 7
+            else [f"Loaded tuning scenario {scenario_id}"]
+        )
         self.attack_damage_done_this_turn = False
         self.turn_number = 1
         self.game_over = False
@@ -626,24 +746,34 @@ class GameState:
         self.all_ships = []
 
         random.seed((self.tuning_seed + scenario_id + random.randint(0, 10000)))
-        if scenario_id == 1:
-            p1_cells = [(4, 4), (4, 4), (4, 5), (5, 5)]
-            p2_cells = [(5, 4), (5, 4), (5, 3), (4, 3)]
-        elif scenario_id == 2:
-            p1_cells = [(3, 5), (3, 5), (4, 5), (4, 4), (5, 5)]
-            p2_cells = [(6, 4), (6, 4), (5, 4), (5, 3), (4, 4)]
-        elif scenario_id == 3:
-            p1_cells = [(3, 4), (3, 4), (3, 5), (4, 5), (4, 4), (5, 5)]
-            p2_cells = [(6, 5), (6, 5), (6, 4), (5, 4), (5, 5), (4, 4)]
-        elif scenario_id == 4:
-            p1_cells = [(2, 4), (2, 4), (3, 4), (3, 5), (4, 5), (4, 4), (5, 5)]
-            p2_cells = [(7, 5), (7, 5), (6, 5), (6, 4), (5, 4), (5, 5), (4, 4)]
-        elif scenario_id == 5:
-            p1_cells = [(3, 3), (3, 3), (3, 4), (4, 4), (4, 5), (5, 5), (5, 4)]
-            p2_cells = [(6, 6), (6, 6), (6, 5), (5, 5), (5, 4), (4, 4), (4, 5)]
-        else:  # scenario 6
-            p1_cells = [(2, 5), (2, 5), (3, 5), (3, 4), (4, 4), (4, 5), (5, 5), (5, 4)]
-            p2_cells = [(7, 4), (7, 4), (6, 4), (6, 5), (5, 5), (5, 4), (4, 4), (4, 5)]
+        if scenario_id == 7:
+            # 5x5 arena, 3 planets — human P1 vs AI P2 (main enables P2 AI).
+            self.board_size = 5
+            self.ai_vs_ai = False
+            self.planets = [(1, 1), (3, 3), (0, 2)]
+            p1_cells = [(2, 0), (2, 0), (1, 0)]
+            p2_cells = [(2, 4), (2, 4), (3, 4)]
+        else:
+            self.board_size = 10
+            self.ai_vs_ai = False
+            if scenario_id == 1:
+                p1_cells = [(4, 4), (4, 4), (4, 5), (5, 5)]
+                p2_cells = [(5, 4), (5, 4), (5, 3), (4, 3)]
+            elif scenario_id == 2:
+                p1_cells = [(3, 5), (3, 5), (4, 5), (4, 4), (5, 5)]
+                p2_cells = [(6, 4), (6, 4), (5, 4), (5, 3), (4, 4)]
+            elif scenario_id == 3:
+                p1_cells = [(3, 4), (3, 4), (3, 5), (4, 5), (4, 4), (5, 5)]
+                p2_cells = [(6, 5), (6, 5), (6, 4), (5, 4), (5, 5), (4, 4)]
+            elif scenario_id == 4:
+                p1_cells = [(2, 4), (2, 4), (3, 4), (3, 5), (4, 5), (4, 4), (5, 5)]
+                p2_cells = [(7, 5), (7, 5), (6, 5), (6, 4), (5, 4), (5, 5), (4, 4)]
+            elif scenario_id == 5:
+                p1_cells = [(3, 3), (3, 3), (3, 4), (4, 4), (4, 5), (5, 5), (5, 4)]
+                p2_cells = [(6, 6), (6, 6), (6, 5), (5, 5), (5, 4), (4, 4), (4, 5)]
+            else:  # scenario 6
+                p1_cells = [(2, 5), (2, 5), (3, 5), (3, 4), (4, 4), (4, 5), (5, 5), (5, 4)]
+                p2_cells = [(7, 4), (7, 4), (6, 4), (6, 5), (5, 5), (5, 4), (4, 4), (4, 5)]
 
         sid = 0
         # Ensure each side has a premade destroyer-containing fleet anchor.
@@ -686,6 +816,7 @@ class GameState:
             ship.shots = 1
             ship.did_move_this_turn = False
             ship.did_dogfight_this_turn = False
+            ship.did_hyperdrive_this_turn = False
             ship.fighters_used_this_turn = 0
             ship.bombers_used_this_turn = 0
             ship.pending_bomber_strikes = 0
@@ -856,6 +987,8 @@ class GameState:
             "winner": self.winner,
             "next_ship_id": self.next_ship_id,
             "build_menu_open": self.build_menu_open,
+            "board_size": self.board_size,
+            "ai_vs_ai": getattr(self, "ai_vs_ai", False),
         }
         self.state_history.append(snapshot)
 
@@ -871,6 +1004,8 @@ class GameState:
                 self.winner = state.get("winner")
                 self.next_ship_id = state.get("next_ship_id", self.next_ship_id)
                 self.build_menu_open = state.get("build_menu_open", False)
+                self.board_size = state.get("board_size", 10)
+                self.ai_vs_ai = state.get("ai_vs_ai", False)
                 self.action_log = ["Turn reset to start state."]
                 break
 
@@ -886,6 +1021,8 @@ class GameState:
             self.winner = state.get("winner")
             self.next_ship_id = state.get("next_ship_id", self.next_ship_id)
             self.build_menu_open = state.get("build_menu_open", False)
+            self.board_size = state.get("board_size", 10)
+            self.ai_vs_ai = state.get("ai_vs_ai", False)
 
     def switch_turns(self):
         if self.game_over:
@@ -927,12 +1064,16 @@ class GameState:
             s.shots = 1
             s.did_move_this_turn = False
             s.did_dogfight_this_turn = False
+            s.did_hyperdrive_this_turn = False
             s.fighters_used_this_turn = 0
             s.bombers_used_this_turn = 0
             s.pending_bomber_strikes = 0
             s.pending_fighter_strikes = 0
             s.pending_air_center = None
             s.start_x, s.start_y = s.x, s.y
+            s.hyperdrive_dx = None
+            s.hyperdrive_dy = None
+            s.hyperdrive_steps_used = 0
         self.build_menu_open = False
         self._assign_move_budgets_for_turn_start()
         self.save_state("Start of Turn")
@@ -949,14 +1090,31 @@ class GameState:
             self.action_log = ["Cannot charge this selection."]
             return False
         if ship.is_charged:
-            self.action_log = ["Hyperdrive ready: press WASD to jump up to 8 spaces."]
+            steps = getattr(ship, "hyperdrive_steps_used", 0) or 0
+            if steps > 0:
+                move_group = mobile_ships_at(self, ship.x, ship.y, ship.owner)
+                if not move_group or ship not in move_group:
+                    move_group = [ship]
+                self._finalize_hyperdrive_glide(move_group, consumed_action=True)
+                self.action_log = ["Hyperdrive stopped early."]
+                return False
+            self.action_log = [
+                "Hyperdrive: each WASD moves 1 tile in a locked line "
+                f"(max {HYPERDRIVE_MAX_STEPS}); press C again to finish before using all steps.",
+            ]
             return True
         if ship.is_charging:
             self.action_log = ["Already charging; end turn without moving/firing."]
             return False
+        if (ship.x, ship.y) != (ship.start_x, ship.start_y):
+            self.action_log = ["Charge denied: must charge from your start-of-turn space (R to reset)."]
+            return False
         ship.is_charging = True
         ship.is_charged = False
         ship.charge_turns = 0
+        ship.hyperdrive_dx = None
+        ship.hyperdrive_dy = None
+        ship.hyperdrive_steps_used = 0
         self.action_log = ["Charging started. End turn without movement/fire; next turn WASD will hyperdrive."]
         return False
 
@@ -1025,6 +1183,29 @@ class GameState:
         if enemies:
             self.select_ship_at(x, y, True)
 
+    def _fleet_broadcast_hyper_metadata(self, anchor, move_group):
+        """Keep glide counters/direction synced across stacked mobiles."""
+        for m in move_group:
+            m.hyperdrive_dx = anchor.hyperdrive_dx
+            m.hyperdrive_dy = anchor.hyperdrive_dy
+            m.hyperdrive_steps_used = anchor.hyperdrive_steps_used
+
+    def _finalize_hyperdrive_glide(self, move_group, *, consumed_action):
+        """Ends a glide (charge spent). consumed_action iff the ship actually moved this glide."""
+        if not move_group:
+            return
+        for m in move_group:
+            m.hyperdrive_dx = None
+            m.hyperdrive_dy = None
+            m.hyperdrive_steps_used = 0
+            m.is_charging = False
+            m.is_charged = False
+            m.charge_turns = 0
+            if consumed_action:
+                m.has_moved = True
+                m.did_move_this_turn = True
+                m.move_budget_remaining = 0
+
     def hyperdrive_move(self, ship, key):
         if self.game_over:
             self.action_log = [f"Game over. Player {self.winner} wins. Press G for new match."]
@@ -1032,7 +1213,7 @@ class GameState:
         if ship.owner != self.active_player or getattr(ship, "is_base", False):
             self.action_log = ["Hyperdrive denied."]
             return
-        if key not in ['w', 'a', 's', 'd']:
+        if key not in _HYPER_KEY_TO_VEC:
             return
         if not ship.is_charged:
             self.action_log = ["Hyperdrive denied: ship is not charged yet."]
@@ -1041,40 +1222,77 @@ class GameState:
             self.action_log = ["Hyperdrive denied: ship already acted."]
             return
 
-        dx, dy = 0, 0
-        if key == 'w':
-            dy = -1
-        if key == 'a':
-            dx = -1
-        if key == 's':
-            dy = 1
-        if key == 'd':
-            dx = 1
+        move_group = mobile_ships_at(self, ship.x, ship.y, ship.owner)
+        if not move_group or ship not in move_group:
+            move_group = [ship]
 
-        steps = 8
-        ox, oy = ship.x, ship.y
-        for _ in range(steps):
-            nx = max(0, min(self.board_size - 1, ship.x + dx))
-            ny = max(0, min(self.board_size - 1, ship.y + dy))
-            if (nx, ny) == (ship.x, ship.y):
-                break
-            blocker = next((s for s in self.all_ships if s.id != ship.id and s.x == nx and s.y == ny), None)
-            ship.x, ship.y = nx, ny
-            if blocker is not None:
-                break
+        vx, vy = _HYPER_KEY_TO_VEC[key]
+        steps_used = getattr(ship, "hyperdrive_steps_used", 0) or 0
 
-        moved = (ship.x != ox or ship.y != oy)
-        if moved:
-            ship.has_moved = True
-            ship.did_move_this_turn = True
-            ship.move_budget_remaining = 0
-            ship.is_charged = False
-            ship.is_charging = False
-            ship.charge_turns = 0
-            self.try_spawn_base_on_planet(ship)
-            self.action_log = [f"Hyperdrive: moved to ({ship.x},{ship.y})"]
+        if steps_used == 0:
+            ship.hyperdrive_dx, ship.hyperdrive_dy = vx, vy
+        elif (ship.hyperdrive_dx, ship.hyperdrive_dy) != (vx, vy):
+            lock = _HYPER_VEC_TO_KEY.get((ship.hyperdrive_dx, ship.hyperdrive_dy), "?")
+            self.action_log = [
+                f"Hyperdrive locked to [{lock.upper()}]; same direction for each step ({HYPERDRIVE_MAX_STEPS} max), or C to stop.",
+            ]
+            return
+
+        self._fleet_broadcast_hyper_metadata(ship, move_group)
+
+        nx = max(0, min(self.board_size - 1, ship.x + vx))
+        ny = max(0, min(self.board_size - 1, ship.y + vy))
+        incoming_ids = {s.id for s in move_group}
+        if (nx, ny) == (ship.x, ship.y):
+            if steps_used == 0:
+                self.action_log = ["Hyperdrive blocked by map edge."]
+                return
+            self._finalize_hyperdrive_glide(move_group, consumed_action=True)
+            self.action_log = [f"Hyperdrive ended at edge after {steps_used} step(s); now ({ship.x},{ship.y})."]
+            return
+
+        blocker = next(
+            (
+                b
+                for b in self.all_ships
+                if b.id not in incoming_ids
+                and b.x == nx
+                and b.y == ny
+            ),
+            None,
+        )
+
+        for mover in move_group:
+            mover.x = nx
+            mover.y = ny
+            mover.did_hyperdrive_this_turn = True
+
+        ship.hyperdrive_steps_used = steps_used + 1
+        self._fleet_broadcast_hyper_metadata(ship, move_group)
+        for mover in move_group:
+            self.try_spawn_base_on_planet(mover)
+
+        stepped = ship.hyperdrive_steps_used
+        hit_planet = (ship.x, ship.y) in self.planets
+        done = blocker is not None or hit_planet or stepped >= HYPERDRIVE_MAX_STEPS
+
+        if done:
+            self._finalize_hyperdrive_glide(move_group, consumed_action=True)
+            if stepped >= HYPERDRIVE_MAX_STEPS:
+                why = "max range"
+            elif hit_planet:
+                why = "planet"
+            elif blocker is not None:
+                why = "collision"
+            else:
+                why = "stopped"
+            self.action_log = [
+                f"Hyperdrive ({why}): {stepped} step(s) → ({ship.x},{ship.y})",
+            ]
         else:
-            self.action_log = ["Hyperdrive blocked by map edge."]
+            self.action_log = [
+                f"Hyperdrive step {stepped}/{HYPERDRIVE_MAX_STEPS} → ({ship.x},{ship.y}); repeat [{key.upper()}] or C to stop.",
+            ]
 
     def toggle_build_menu(self):
         if self.game_over:
@@ -1102,10 +1320,64 @@ class GameState:
         idx = slot_index_one_based - 1
         if not (0 <= idx < len(BUILD_MENU_ORDER)):
             return
-        ship_type = BUILD_MENU_ORDER[idx]
+        entry = BUILD_MENU_ORDER[idx]
+        if entry == HANGAR_FIGHTER_KEY:
+            cost = SHIP_TEMPLATES["Fighter"]["cost"]
+            if base.scrap + 1e-9 < cost:
+                self.action_log = [f"Not enough scrap (need {cost}, have {base.scrap})."]
+                return
+            recipient = pick_hangar_recipient_at_base(self, base)
+            if recipient is None:
+                self.action_log = ["Hangar denied: no ship with runway space docked at this base."]
+                return
+            self.save_state("Pre-Build")
+            base.scrap -= cost
+            recipient.fighters = int(recipient.fighters) + 1
+            self.action_log = [
+                f"Bought fighter for {recipient.ship_type} (hangar "
+                f"{aircraft_aircraft_stored_total(recipient)}/{aircraft_carrying_capacity_int(recipient)}).",
+            ]
+            self.build_menu_open = False
+            self._assign_move_budgets_for_turn_start()
+            return
+        if entry == HANGAR_BOMBER_KEY:
+            cost = SHIP_TEMPLATES["Bomber"]["cost"]
+            if base.scrap + 1e-9 < cost:
+                self.action_log = [f"Not enough scrap (need {cost}, have {base.scrap})."]
+                return
+            recipient = pick_hangar_recipient_at_base(self, base)
+            if recipient is None:
+                self.action_log = ["Hangar denied: no ship with runway space docked at this base."]
+                return
+            self.save_state("Pre-Build")
+            base.scrap -= cost
+            recipient.bombers = int(recipient.bombers) + 1
+            self.action_log = [
+                f"Bought bomber for {recipient.ship_type} (hangar "
+                f"{aircraft_aircraft_stored_total(recipient)}/{aircraft_carrying_capacity_int(recipient)}).",
+            ]
+            self.build_menu_open = False
+            self._assign_move_budgets_for_turn_start()
+            return
+
+        ship_type = entry
         cost = SHIP_TEMPLATES[ship_type]["cost"]
         if base.scrap + 1e-9 < cost:
             self.action_log = [f"Not enough scrap (need {cost}, have {base.scrap})."]
+            return
+        # Composition rules: simulate adding the new hull to the base tile's
+        # current mobile stack and reject if it would break Dreadnaught
+        # exclusivity or the max-4-capitals cap.
+        prospective_ship = Ship(base.x, base.y, base.owner, -1, ship_type=ship_type, just_built=True)
+        existing_mobiles = mobile_ships_at(self, base.x, base.y, base.owner)
+        violation_b = _fleet_rule_violation(list(existing_mobiles) + [prospective_ship])
+        if violation_b:
+            if "Dreadnaught" in violation_b:
+                self.action_log = [
+                    "Build denied: Dreadnaught cannot fleet with Cruiser / Heavy Cruiser / Aircraft Carrier."
+                ]
+            else:
+                self.action_log = ["Build denied: max 4 large ships per fleet."]
             return
         self.save_state("Pre-Build")
         base.scrap -= cost
@@ -1132,6 +1404,9 @@ class GameState:
             ship.is_charging = False
             ship.is_charged = False
             ship.charge_turns = 0
+            ship.hyperdrive_dx = None
+            ship.hyperdrive_dy = None
+            ship.hyperdrive_steps_used = 0
             self.action_log = ["Charging interrupted by action."]
 
         if key in ['w', 'a', 's', 'd']:
@@ -1172,10 +1447,20 @@ class GameState:
             if self.attack_damage_done_this_turn and destination_friendlies:
                 self.action_log = ["Fleet/defleet locked after first attack damage this turn."]
                 return
+            # Composition rules for the post-merge stack at the destination.
+            stack_after = list(move_group_early) + list(destination_friendlies)
+            violation = _fleet_rule_violation(stack_after)
+            if violation:
+                self.action_log = [violation]
+                return
 
         if key == 'f':
             if getattr(ship, "just_built", False):
                 self.action_log = ["New ships cannot fire until your next activation."]
+                return
+            peer_stack = mobile_ships_at(self, ship.x, ship.y, ship.owner)
+            if any(getattr(s, "did_hyperdrive_this_turn", False) for s in peer_stack):
+                self.action_log.append("Cannot attack this turn after using hyperdrive (same fleet).")
                 return
 
         # Trace logic for the lower right UI box
@@ -1317,9 +1602,12 @@ class GameState:
 
         # Charge Logic
         if key == 'c' and not ship.is_charging:
-            ship.is_charging = True
-            for s in ship.fleet_list: s.is_charging = True
-            self.action_log.append("Action C: Charging")
+            if (ship.x, ship.y) != (ship.start_x, ship.start_y):
+                self.action_log.append("Charge denied: must charge from your start-of-turn space.")
+            else:
+                ship.is_charging = True
+                for s in ship.fleet_list: s.is_charging = True
+                self.action_log.append("Action C: Charging")
             
         # Clean up dead ships
         self._cleanup_destroyed_ships()
@@ -1363,6 +1651,22 @@ class GameState:
             dy = 1
         if key == 'd':
             dx = 1
+
+        # Composition rules for the post-merge stack at the destination.
+        peek_x = max(0, min(self.board_size - 1, ship.x + dx))
+        peek_y = max(0, min(self.board_size - 1, ship.y + dy))
+        destination_friendlies_v = [
+            s for s in self.all_ships
+            if s.owner == ship.owner
+            and not getattr(s, "is_base", False)
+            and not getattr(s, "is_aircraft_counter", False)
+            and s.id != ship.id
+            and s.x == peek_x and s.y == peek_y
+        ]
+        violation_v = _fleet_rule_violation([ship] + destination_friendlies_v)
+        if violation_v:
+            self.action_log.append(violation_v)
+            return
 
         original_x, original_y = ship.x, ship.y
         ship.x = max(0, min(self.board_size - 1, ship.x + dx))

@@ -4,22 +4,35 @@ import time
 
 from game_logic import (
     BUILD_MENU_ORDER,
+    DESTROYER_TYPES,
+    HANGAR_BOMBER_KEY,
+    HANGAR_FIGHTER_KEY,
+    HYPERDRIVE_MAX_STEPS,
     LIGHT_SHIP_TYPES,
     SHIP_TEMPLATES,
     evaluate_board,
+    focus_fire_potential,
     is_base_guarded,
     manhattan_distance,
     mobile_ships_at,
+    pick_hangar_recipient_at_base,
+    threat_map_for,
+)
+
+TANK_HULL_TYPES = frozenset(
+    {"Cruiser", "Heavy Cruiser", "Dreadnaught", "Aircraft Carrier", "Super Star Destroyer"}
 )
 
 
 class AIController:
-    QUICK_BUDGET_MS = 200
-    QUIET_BUDGET_MS = 500
-    MODERATE_BUDGET_MS = 1200
-    DECISIVE_BUDGET_MS = 2500
-    BUDGET_CEILING_MS = 4000
-    BUDGET_FLOOR_MS = 200
+    _HYPER_VEC_TO_KEY = {(0, -1): "w", (-1, 0): "a", (0, 1): "s", (1, 0): "d"}
+
+    QUICK_BUDGET_MS = 250
+    QUIET_BUDGET_MS = 2000
+    MODERATE_BUDGET_MS = 5000
+    DECISIVE_BUDGET_MS = 9000
+    BUDGET_CEILING_MS = 12000
+    BUDGET_FLOOR_MS = 500
     MODERATE_SWING_THRESHOLD = 20.0
     DECISIVE_SWING_THRESHOLD = 60.0
     KILL_SWING_BONUS = 10.0
@@ -27,13 +40,15 @@ class AIController:
     def __init__(
         self,
         owner=2,
-        depth=2,
+        depth=4,
+        min_depth=3,
         top_k_turns=4,
         max_actions_per_turn=12,
-        time_budget_ms=600,
+        time_budget_ms=2000,
     ):
         self.owner = owner
         self.depth = depth
+        self.min_depth = min_depth
         self.top_k_turns = top_k_turns
         self.max_actions_per_turn = max_actions_per_turn
         self.time_budget_ms = time_budget_ms
@@ -41,6 +56,11 @@ class AIController:
         self.max_branch_actions = max(8, top_k_turns * 2)
         self.queued_plan = []
         self.is_thinking = False
+        # Search memo (reset each pick_best_turn)
+        self._leaf_tt = {}
+        self._history_table = {}
+        self._killer_actions = []
+        self._threat_map_cache = {}
 
     def has_plan(self):
         return bool(self.queued_plan)
@@ -55,6 +75,10 @@ class AIController:
         self.is_thinking = False
 
     def pick_best_turn(self, game):
+        self._leaf_tt.clear()
+        self._history_table.clear()
+        self._killer_actions.clear()
+        self._threat_map_cache.clear()
         if game.active_player != self.owner:
             return []
         root = self._clone_for_search(game)
@@ -68,14 +92,29 @@ class AIController:
 
         self.time_budget_ms = self._budget_for_swing(swing)
         search_start = time.monotonic()
-        _, best_plan = self._negamax(
-            root,
-            self.depth,
-            float("-inf"),
-            float("inf"),
-            self.owner,
-            search_start,
-        )
+        best_plan = None
+
+        # Iterative deepening: complete shallow depths first so we always have a
+        # plan, then keep refining at greater depths until the budget runs out.
+        # This means depth 3 is a guarantee on most turns and depth 4 is a bonus
+        # when the position is simple enough to finish in time.
+        for depth in range(self.min_depth, self.depth + 1):
+            if self._time_exceeded(search_start):
+                break
+            self._current_root_depth = depth
+            _, plan = self._negamax(
+                root,
+                depth,
+                float("-inf"),
+                float("inf"),
+                self.owner,
+                search_start,
+            )
+            if plan:
+                best_plan = plan
+            if self._time_exceeded(search_start):
+                break
+
         self.time_budget_ms = self.default_time_budget_ms
         if not best_plan:
             return [("end",)]
@@ -330,11 +369,25 @@ class AIController:
                 continue
 
             if getattr(ship, "is_base", False):
-                affordable = [
-                    idx
-                    for idx, ship_type in enumerate(BUILD_MENU_ORDER, start=1)
-                    if ship.scrap + 1e-9 >= SHIP_TEMPLATES[ship_type]["cost"]
-                ]
+                affordable = []
+                for idx, raw in enumerate(BUILD_MENU_ORDER, start=1):
+                    if raw == HANGAR_FIGHTER_KEY:
+                        cost = SHIP_TEMPLATES["Fighter"]["cost"]
+                        if ship.scrap + 1e-9 < cost:
+                            continue
+                        if pick_hangar_recipient_at_base(game, ship) is None:
+                            continue
+                    elif raw == HANGAR_BOMBER_KEY:
+                        cost = SHIP_TEMPLATES["Bomber"]["cost"]
+                        if ship.scrap + 1e-9 < cost:
+                            continue
+                        if pick_hangar_recipient_at_base(game, ship) is None:
+                            continue
+                    else:
+                        cost = SHIP_TEMPLATES[raw]["cost"]
+                        if ship.scrap + 1e-9 < cost:
+                            continue
+                    affordable.append(idx)
                 affordable.sort(
                     key=lambda slot: self._build_priority(game, owner, BUILD_MENU_ORDER[slot - 1]),
                     reverse=True,
@@ -344,9 +397,17 @@ class AIController:
                 continue
 
             if ship.is_charged and not ship.has_moved and not ship.has_fired:
-                for key in "wasd":
-                    if self._can_step(ship.x, ship.y, key, game.board_size):
-                        actions.append(("hyper", ship.id, key))
+                su = getattr(ship, "hyperdrive_steps_used", 0) or 0
+                if su == 0:
+                    for hk in "wasd":
+                        if self._can_step(ship.x, ship.y, hk, game.board_size):
+                            actions.append(("hyper", ship.id, hk))
+                elif su < HYPERDRIVE_MAX_STEPS:
+                    lk = None
+                    if ship.hyperdrive_dx is not None and ship.hyperdrive_dy is not None:
+                        lk = self._HYPER_VEC_TO_KEY.get((ship.hyperdrive_dx, ship.hyperdrive_dy))
+                    if lk and self._can_step(ship.x, ship.y, lk, game.board_size):
+                        actions.append(("hyper", ship.id, lk))
 
             if getattr(ship, "move_budget_remaining", 0) > 0:
                 move_keys = sorted(
@@ -370,18 +431,114 @@ class AIController:
                 and not ship.is_charged
                 and not ship.has_moved
                 and not ship.has_fired
+                and (ship.x, ship.y) == (ship.start_x, ship.start_y)
             ):
                 actions.append(("charge", ship.id))
 
             fire_actions = self._enumerate_fire_actions(game, ship, enemy_targets)
             actions.extend(fire_actions)
 
+        actions = self._sort_action_list(game, owner, actions)
         actions.append(("end",))
         return actions
+
+    def _sort_action_list(self, game, owner, actions):
+        killers = {tuple(x) for x in self._killer_actions}
+        # Per-call cache: (state signature, action tuple) -> hp_delta
+        sig = self._state_signature(game)
+        fire_delta_cache = {}
+
+        def sort_key(atom):
+            t = tuple(atom)
+            killer_boost = 4e6 if t in killers else 0.0
+            hist_boost = self._history_table.get(t, 0) * 120.0
+            return killer_boost + hist_boost + self._atomic_action_estimate_priority(
+                game, owner, atom, sig=sig, fire_delta_cache=fire_delta_cache,
+            )
+
+        return sorted(actions, key=sort_key, reverse=True)
+
+    def _atomic_action_estimate_priority(self, game, owner, action, sig=None, fire_delta_cache=None):
+        k = action[0]
+        if k == "end":
+            return -1e12
+        if k == "fire":
+            ship = self._ship_by_id(game, action[1])
+            tgt = self._ship_by_id(game, action[2])
+            if ship is None or tgt is None:
+                return -900.0
+            bonus = 420.0 + focus_fire_potential(game, tgt, owner) * 14.0
+            if getattr(tgt, "is_base", False):
+                bonus += 1100.0
+            # T1. Destroyer assassination — heavily prefer killing a stack's only
+            # destroyer (it strands the rest of the stack).
+            if (
+                not getattr(tgt, "is_base", False)
+                and getattr(tgt, "ship_type", None) in DESTROYER_TYPES
+            ):
+                stack = mobile_ships_at(game, tgt.x, tgt.y, tgt.owner)
+                destroyers_in_stack = sum(1 for s in stack if s.ship_type in DESTROYER_TYPES)
+                non_destroyers_in_stack = sum(1 for s in stack if s.ship_type not in DESTROYER_TYPES)
+                if destroyers_in_stack == 1 and non_destroyers_in_stack >= 1:
+                    bonus += 1500.0
+                elif len(stack) >= 2:
+                    bonus += 400.0
+            # Tactical-template "must-consider attacks": simulate the fire and
+            # add a strong ordering boost if it actually delivers damage.
+            cache_key = None
+            if fire_delta_cache is not None:
+                cache_key = (sig if sig is not None else self._state_signature(game), tuple(action))
+                if cache_key in fire_delta_cache:
+                    hp_delta = fire_delta_cache[cache_key]
+                else:
+                    sim = self._clone_for_search(game)
+                    if self.apply_action(sim, action, simulate=True):
+                        hp_delta = self._enemy_hp_delta(game, sim, owner)
+                    else:
+                        hp_delta = 0.0
+                    fire_delta_cache[cache_key] = hp_delta
+            else:
+                sim = self._clone_for_search(game)
+                if self.apply_action(sim, action, simulate=True):
+                    hp_delta = self._enemy_hp_delta(game, sim, owner)
+                else:
+                    hp_delta = 0.0
+            if hp_delta > 0:
+                bonus += 5000.0 + hp_delta * 800.0
+            return bonus
+        if k == "hyper":
+            return 720.0
+        if k == "charge":
+            return 535.0
+        if k == "build":
+            entry = BUILD_MENU_ORDER[action[2] - 1]
+            return 360.0 + self._build_priority(game, owner, entry)
+        if k == "move":
+            ship = self._ship_by_id(game, action[1])
+            if ship is None:
+                return -300.0
+            move_key = action[2]
+            bonus = self._movement_priority(game, ship, move_key, owner)
+            nx, ny = self._next_position(ship.x, ship.y, move_key, game.board_size)
+            if getattr(game, "turn_number", 99) <= 6:
+                if (nx, ny) in game.planets and game.base_at(nx, ny) is None:
+                    bonus += 48.0
+            # T2a. Tank-on-base: park a high-HP friendly hull on an unguarded
+            # friendly base, especially when that base is under enemy threat.
+            bonus += self._tank_on_base_bonus(game, ship, nx, ny, owner)
+            return bonus + 40.0
+        if k == "vmove":
+            ship = self._ship_by_id(game, action[1])
+            if ship is None:
+                return -400.0
+            return self._movement_priority(game, ship, action[2], owner) - 70.0
+        return 0.0
 
     def _enumerate_fire_actions(self, game, ship, enemy_targets):
         actions = []
         if getattr(ship, "just_built", False):
+            return actions
+        if getattr(ship, "did_hyperdrive_this_turn", False):
             return actions
 
         pending_center = getattr(ship, "pending_air_center", None)
@@ -415,19 +572,50 @@ class AIController:
                 actions.append(("fire", ship.id, target.id))
         return actions
 
-    def _negamax(self, game, depth, alpha, beta, owner, start_time):
-        if self._time_exceeded(start_time) or depth <= 0:
-            return self._owner_score(game, owner), [("end",)]
+    def _record_killer_cutoff(self, plan):
+        if not plan:
+            return
+        first = tuple(plan[0])
+        if first not in self._killer_actions:
+            self._killer_actions.insert(0, first)
+            self._killer_actions = self._killer_actions[:6]
+        self._history_table[first] = self._history_table.get(first, 0) + 3
 
-        top_k = self.top_k_turns if depth == self.depth else max(2, self.top_k_turns - 1)
+    def _negamax(self, game, depth, alpha, beta, owner, start_time):
+        if self._time_exceeded(start_time):
+            return self._owner_score(game, owner), [("end",)]
+        if depth <= 0:
+            leaf_key = (self._state_signature(game), owner)
+            cached = self._leaf_tt.get(leaf_key)
+            if cached is not None:
+                return cached, [("end",)]
+            sc = self._owner_score(game, owner)
+            self._leaf_tt[leaf_key] = sc
+            return sc, [("end",)]
+
+        # Wider beam at the root of the current search; tighter at interior plies
+        # to keep the deeper search tractable.
+        root_depth = getattr(self, "_current_root_depth", self.depth)
+        top_k = self.top_k_turns if depth == root_depth else max(2, self.top_k_turns - 1)
         candidates = self.enumerate_candidate_turns(game, owner, start_time, top_k=top_k)
         if not candidates:
             return self._owner_score(game, owner), [("end",)]
 
+        def candidate_sort_key(cp):
+            if not cp.get("plan"):
+                return (-1e13, cp["score"])
+            first_act = tuple(cp["plan"][0])
+            killer_hit = first_act in {tuple(k) for k in self._killer_actions}
+            kboost = 1e12 if killer_hit else 0.0
+            est = self._atomic_action_estimate_priority(game, owner, cp["plan"][0])
+            return (kboost + est + cp["score"] * 1e-6, cp["score"])
+
+        candidates_ordered = sorted(candidates, key=candidate_sort_key, reverse=True)
+
         best_score = float("-inf")
-        best_plan = candidates[0]["plan"]
+        best_plan = candidates_ordered[0]["plan"]
         next_owner = 1 if owner == 2 else 2
-        for candidate in candidates:
+        for candidate in candidates_ordered:
             child_score, _ = self._negamax(
                 candidate["state"],
                 depth - 1,
@@ -441,7 +629,10 @@ class AIController:
                 best_score = score
                 best_plan = candidate["plan"]
             alpha = max(alpha, score)
-            if alpha >= beta or self._time_exceeded(start_time):
+            if alpha >= beta:
+                self._record_killer_cutoff(candidate["plan"])
+                break
+            if self._time_exceeded(start_time):
                 break
 
         return best_score, best_plan
@@ -491,8 +682,8 @@ class AIController:
                         bonus -= 28.0
 
         if kind == "build":
-            built_type = BUILD_MENU_ORDER[action[2] - 1]
-            bonus += self._build_priority(before_game, owner, built_type)
+            entry = BUILD_MENU_ORDER[action[2] - 1]
+            bonus += self._build_priority(before_game, owner, entry)
 
         if kind == "fire":
             target = self._ship_by_id(before_game, action[2])
@@ -500,16 +691,159 @@ class AIController:
                 bonus += 250.0
             if getattr(after_game, "game_over", False) and getattr(after_game, "winner", None) == owner:
                 bonus += 50000.0
+            hp_delta = self._enemy_hp_delta(before_game, after_game, owner)
+            if hp_delta > 0:
+                bonus += hp_delta * 60.0
+            # T1. If the fire just removed the only destroyer in an enemy stack
+            # while non-destroyer mobiles remain, that stack is now frozen.
+            if target is not None and not getattr(target, "is_base", False):
+                tx, ty, tow = target.x, target.y, target.owner
+                before_stack = mobile_ships_at(before_game, tx, ty, tow)
+                before_destroyers = sum(1 for s in before_stack if s.ship_type in DESTROYER_TYPES)
+                after_stack = mobile_ships_at(after_game, tx, ty, tow)
+                after_destroyers = sum(1 for s in after_stack if s.ship_type in DESTROYER_TYPES)
+                after_non_destroyers = sum(1 for s in after_stack if s.ship_type not in DESTROYER_TYPES)
+                if before_destroyers >= 1 and after_destroyers == 0 and after_non_destroyers >= 1:
+                    bonus += 200.0
 
         return bonus
 
-    def _build_priority(self, game, owner, ship_type):
-        enemy_ships = [s for s in game.all_ships if s.owner != owner]
+    def _enemy_threat_map(self, game, owner):
+        """Cached enemy threat map for the current `pick_best_turn` search."""
+        sig = self._state_signature(game)
+        opp = 1 if owner == 2 else 2
+        cache = getattr(self, "_threat_map_cache", None)
+        if cache is None:
+            cache = {}
+            self._threat_map_cache = cache
+        key = (sig, opp)
+        cached = cache.get(key)
+        if cached is None:
+            cached = threat_map_for(game, opp)
+            cache[key] = cached
+        return cached
+
+    def _tank_on_base_bonus(self, game, ship, nx, ny, owner):
+        if ship is None or getattr(ship, "is_aircraft_counter", False):
+            return 0.0
+        if getattr(ship, "ship_type", None) not in TANK_HULL_TYPES:
+            return 0.0
+        base = game.base_at(nx, ny)
+        if base is None or base.owner != owner:
+            return 0.0
+        if is_base_guarded(game, base):
+            return 0.0
+        bonus = 800.0
+        threat_map = self._enemy_threat_map(game, owner)
+        if threat_map.get((nx, ny), 0.0) > 0.0:
+            bonus += 700.0
+        return bonus
+
+    def _enemy_hp_delta(self, before_game, after_game, owner):
+        """Total HP that `owner`'s actions removed from enemy ships (mobile or base)
+        between before_game and after_game. Destroyed ships count their full
+        before-state HP, capped at max_health. aircraft-counter ships included so
+        bombers/fighters being chewed in a dogfight also register.
+        """
+        before_hp = {}
+        before_max = {}
+        for s in before_game.all_ships:
+            if s.owner == owner:
+                continue
+            before_hp[s.id] = float(getattr(s, "hp", 0.0))
+            before_max[s.id] = float(getattr(s, "max_health", 0.0)) or before_hp[s.id]
+
+        delta = 0.0
+        survivors = {s.id: float(getattr(s, "hp", 0.0)) for s in after_game.all_ships if s.owner != owner}
+        for sid, hp in before_hp.items():
+            after_hp = survivors.get(sid)
+            if after_hp is None:
+                delta += min(hp, before_max.get(sid, hp))
+            elif after_hp < hp:
+                delta += hp - after_hp
+        return max(0.0, delta)
+
+    def _build_priority(self, game, owner, menu_entry):
         bonus = 0.0
-        if any(s.ship_type == "Cruiser" for s in enemy_ships) and ship_type == "Aircraft Carrier":
+        if menu_entry == HANGAR_FIGHTER_KEY:
+            allied_air = sum(
+                getattr(s, "fighters", 0) + getattr(s, "bombers", 0)
+                for s in game.all_ships
+                if s.owner == owner and not getattr(s, "is_base", False)
+            )
+            enemy_air = sum(
+                getattr(s, "fighters", 0) + getattr(s, "bombers", 0)
+                for s in game.all_ships
+                if s.owner != owner and not getattr(s, "is_base", False)
+            )
+            if allied_air <= enemy_air + 3:
+                bonus += 70.0
+            return bonus
+        if menu_entry == HANGAR_BOMBER_KEY:
+            unguarded_enemy_bases = [
+                b
+                for b in game.all_ships
+                if b.owner != owner and getattr(b, "is_base", False) and not is_base_guarded(game, b)
+            ]
+            if unguarded_enemy_bases:
+                bonus += 60.0
+            allied_air = sum(
+                getattr(s, "fighters", 0) + getattr(s, "bombers", 0)
+                for s in game.all_ships
+                if s.owner == owner and not getattr(s, "is_base", False)
+            )
+            enemy_air = sum(
+                getattr(s, "fighters", 0) + getattr(s, "bombers", 0)
+                for s in game.all_ships
+                if s.owner != owner and not getattr(s, "is_base", False)
+            )
+            if allied_air <= enemy_air + 3:
+                bonus += 40.0
+            return bonus
+        enemy_ships = [s for s in game.all_ships if s.owner != owner]
+        if any(s.ship_type == "Cruiser" for s in enemy_ships) and menu_entry == "Aircraft Carrier":
             bonus += 40.0
-        if any(s.ship_type == "Dreadnaught" for s in enemy_ships) and ship_type in LIGHT_SHIP_TYPES:
+        if any(s.ship_type == "Dreadnaught" for s in enemy_ships) and menu_entry in LIGHT_SHIP_TYPES:
             bonus += 35.0
+
+        # T2b. Tank-build template: if a friendly base is unguarded and the
+        # enemy can reach it, prefer high-HP hulls that can later park on it.
+        threat_map = self._enemy_threat_map(game, owner)
+        threatened_unguarded_base = any(
+            b.owner == owner
+            and getattr(b, "is_base", False)
+            and not is_base_guarded(game, b)
+            and threat_map.get((b.x, b.y), 0.0) > 0.0
+            for b in game.all_ships
+        )
+        if threatened_unguarded_base:
+            if menu_entry == "Heavy Cruiser":
+                bonus += 50.0
+            elif menu_entry == "Cruiser":
+                bonus += 35.0
+            elif menu_entry == "Dreadnaught":
+                bonus += 30.0
+
+        # T4. Replacement-destroyer build: if any friendly stack has
+        # non-destroyer mobiles but no destroyers, building a Destroyer
+        # restores the anchor that lets them move again.
+        if menu_entry == "Destroyer":
+            stacks = {}
+            for s in game.all_ships:
+                if s.owner != owner:
+                    continue
+                if getattr(s, "is_base", False):
+                    continue
+                if getattr(s, "is_aircraft_counter", False):
+                    continue
+                stacks.setdefault((s.x, s.y), []).append(s)
+            for tile_ships in stacks.values():
+                has_destroyer = any(s.ship_type in DESTROYER_TYPES for s in tile_ships)
+                has_non_destroyer = any(s.ship_type not in DESTROYER_TYPES for s in tile_ships)
+                if has_non_destroyer and not has_destroyer:
+                    bonus += 60.0
+                    break
+
         return bonus
 
     def _movement_priority(self, game, ship, key, owner):
@@ -526,6 +860,17 @@ class AIController:
         if enemy_bases:
             priority += max(0.0, 10.0 - min(manhattan_distance((nx, ny), (b.x, b.y)) for b in enemy_bases))
 
+        # T2a. Mirror the tank-on-base movement template into the candidate
+        # ordering so _negamax explores those moves first.
+        priority += self._tank_on_base_bonus(game, ship, nx, ny, owner)
+
+        # T3. Formation cohesion / anti-isolation.
+        centroid = self._allied_centroid(game, owner)
+        if centroid is not None and ship.ship_type not in DESTROYER_TYPES:
+            dist_centroid = manhattan_distance((nx, ny), centroid)
+            if dist_centroid > 2:
+                priority -= 25.0
+
         if ship.ship_type == "Dreadnaught":
             enemies = [
                 e for e in game.all_ships
@@ -538,8 +883,36 @@ class AIController:
                 for e in enemies
             ):
                 priority -= 26.0
+            # T3. Dreadnaught rear-positioning: reward staying >= 2 from the
+            # nearest enemy mobile so it kites behind the line.
+            enemy_mobiles = [
+                e for e in game.all_ships
+                if e.owner != owner
+                and not getattr(e, "is_base", False)
+                and not getattr(e, "is_aircraft_counter", False)
+            ]
+            if enemy_mobiles:
+                nearest = min(manhattan_distance((nx, ny), (e.x, e.y)) for e in enemy_mobiles)
+                if nearest >= 2:
+                    priority += 12.0
 
         return priority
+
+    def _allied_centroid(self, game, owner):
+        xs = []
+        ys = []
+        for s in game.all_ships:
+            if s.owner != owner:
+                continue
+            if getattr(s, "is_base", False):
+                continue
+            if getattr(s, "is_aircraft_counter", False):
+                continue
+            xs.append(s.x)
+            ys.append(s.y)
+        if not xs:
+            return None
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
 
     def _find_hyperdrive_base_assault_plan(self, game):
         best_plan = None
@@ -566,53 +939,40 @@ class AIController:
                 if not self._can_step(ship.x, ship.y, key, game.board_size):
                     continue
                 sim = self._clone_for_search(game)
-                hyper_action = ("hyper", ship.id, key)
-                if not self.apply_action(sim, hyper_action, simulate=True):
+                plan_hyper = []
+                for _burst in range(HYPERDRIVE_MAX_STEPS):
+                    cur = self._ship_by_id(sim, ship.id)
+                    if cur is None or not cur.is_charged:
+                        break
+                    su = getattr(cur, "hyperdrive_steps_used", 0) or 0
+                    lk = key if su == 0 else self._HYPER_VEC_TO_KEY.get((cur.hyperdrive_dx, cur.hyperdrive_dy))
+                    if not lk:
+                        break
+                    if not self._can_step(cur.x, cur.y, lk, sim.board_size):
+                        break
+                    ox, oy = cur.x, cur.y
+                    sim.hyperdrive_move(cur, lk)
+                    after = self._ship_by_id(sim, ship.id)
+                    if after is None:
+                        break
+                    if (after.x, after.y) == (ox, oy):
+                        break
+                    plan_hyper.append(("hyper", ship.id, lk))
+                    if not after.is_charged:
+                        break
+
+                if not plan_hyper:
                     continue
                 moved_ship = self._ship_by_id(sim, ship.id)
                 if moved_ship is None:
                     continue
 
-                for base in [
-                    b for b in sim.all_ships
-                    if b.owner != self.owner and getattr(b, "is_base", False) and not is_base_guarded(sim, b)
-                ]:
-                    legal_fire_actions = [
-                        action
-                        for action in self._enumerate_fire_actions(sim, moved_ship, [base])
-                        if action[2] == base.id
-                    ]
-                    if not legal_fire_actions:
-                        continue
-
-                    plan = [hyper_action]
-                    fire_sim = self._clone_for_search(sim)
-                    while True:
-                        target_base = self._ship_by_id(fire_sim, base.id)
-                        firing_ship = self._ship_by_id(fire_sim, ship.id)
-                        if target_base is None or firing_ship is None:
-                            break
-                        next_actions = [
-                            action
-                            for action in self._enumerate_fire_actions(fire_sim, firing_ship, [target_base])
-                            if action[2] == target_base.id
-                        ]
-                        if not next_actions:
-                            break
-                        action = next_actions[0]
-                        if not self.apply_action(fire_sim, action, simulate=True):
-                            break
-                        plan.append(action)
-                        if getattr(fire_sim, "game_over", False):
-                            break
-
-                    plan.append(("end",))
-                    score = self._owner_score(fire_sim, self.owner)
-                    if getattr(fire_sim, "game_over", False) and getattr(fire_sim, "winner", None) == self.owner:
-                        return plan
-                    if score > best_score:
-                        best_score = score
-                        best_plan = plan
+                # Hyperdrive uses the tactical move this turn — no shooting until next activation.
+                plan = list(plan_hyper) + [("end",)]
+                score = self._owner_score(sim, self.owner)
+                if score > best_score:
+                    best_score = score
+                    best_plan = plan
 
         return best_plan
 
@@ -645,6 +1005,12 @@ class AIController:
                     getattr(ship, "pending_bomber_strikes", 0),
                     getattr(ship, "pending_fighter_strikes", 0),
                     getattr(ship, "pending_air_center", None),
+                    getattr(ship, "hyperdrive_steps_used", 0),
+                    getattr(ship, "hyperdrive_dx", None),
+                    getattr(ship, "hyperdrive_dy", None),
+                    getattr(ship, "did_hyperdrive_this_turn", False),
+                    getattr(ship, "fighters", 0),
+                    getattr(ship, "bombers", 0),
                 )
             )
         return (
