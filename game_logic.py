@@ -2,9 +2,11 @@ import copy
 import math
 import random
 
+from eval_weights import DEFAULT_EVAL_WEIGHTS, merge_eval_weights, score_from_features
+
 SHIP_TEMPLATES = {
     "Cruiser": {
-        "cost": 2.0, "movement": 0.0, "max_health": 6.0, "damage": 2.0, "range": 1.0, "aircraft_storage": 4.0
+        "cost": 2.0, "movement": 0.0, "max_health": 6.0, "damage": 2.0, "range": 0.0, "aircraft_storage": 4.0
     },
     "Light Cruiser": {
         "cost": 2.0, "movement": 2.0, "max_health": 3.0, "damage": 1.0, "range": 1.0, "aircraft_storage": 2.0, "fleet_movement": 2.0
@@ -19,8 +21,9 @@ SHIP_TEMPLATES = {
         "cost": 3.0, "movement": 0.0, "max_health": 4.0, "damage": 0.0, "range": 0.0, "aircraft_storage": 16.0
     },
     "Dreadnaught": {
-        "cost": 3.0, "movement": 0.0, "max_health": 4.0, "damage": 4.0, "range": 1.0, "aircraft_storage": 4.0,
-        "damage_profile": (4.0, 2.0), "range_profile": (1.0, 2.0)
+        "cost": 3.0, "movement": 0.0, "max_health": 4.0, "damage": 4.0, "range": 2.0, "aircraft_storage": 4.0,
+        # Battery: two hull shots per turn — 2 damage at Euclidean distance ≤1, 1 damage at ≤2 (see hull helpers).
+        "damage_profile": (2.0, 1.0), "range_profile": (1.0, 2.0),
     },
     "Heavy Cruiser": {
         "cost": 3.0, "movement": 0.0, "max_health": 7.0, "damage": 2.0, "range": 0.0, "aircraft_storage": 4.0
@@ -100,16 +103,14 @@ DREAD_KITING_BONUS = 16.0
 DREAD_LIGHT_THREAT_PENALTY = 35.0
 EARLY_PLANET_PRESSURE_BONUS = 8.0
 EARLY_BASE_EXPANSION_BONUS = 24.0
-THREAT_BALANCE_WEIGHT = 0.5
+FIGHTER_STRIKE_DAMAGE_VALUE = SHIP_TEMPLATES["Fighter"]["damage"]
+BOMBER_STRIKE_DAMAGE_VALUE = SHIP_TEMPLATES["Bomber"]["damage"]
 FOCUS_FIRE_KILL_BONUS = 25.0
 FOCUS_FIRE_BASE_BONUS = 800.0
 BASE_GUARD_BONUS = 15.0
 BASE_UNGUARDED_PENALTY = 40.0
 BASE_HYPER_THREAT_PENALTY = 120.0
 DEFENDER_HP_BONUS_CAP = 30.0
-AIRCRAFT_DOMINANCE_WEIGHT = 0.8
-FIGHTER_STRIKE_DAMAGE_VALUE = SHIP_TEMPLATES["Fighter"]["damage"]
-BOMBER_STRIKE_DAMAGE_VALUE = SHIP_TEMPLATES["Bomber"]["damage"]
 
 
 def manhattan_distance(a, b):
@@ -193,18 +194,33 @@ def threat_map_for(game, owner):
             move_reach = max(0, int(getattr(ship, "move_budget_remaining", 0)))
         move_reach = min(move_reach, 8)
 
-        hull_damage = float(getattr(ship, "damage", 0)) if getattr(ship, "shots", 0) > 0 else 0.0
-        hull_range = max(0, int(round(float(getattr(ship, "range", 0)))))
+        if getattr(ship, "shots", 0) <= 0:
+            hull_damage_band = 0.0
+        elif ship_is_dreadnaught(ship):
+            # Upper envelope for heuristic map: farthest shells do 1, inner band 2.
+            hull_damage_band = 2.0
+        else:
+            hull_damage_band = float(getattr(ship, "damage", 0))
+        hull_damage = hull_damage_band
+        hull_rf = float(getattr(ship, "range", 0))
+        hull_range = 2 if ship_is_dreadnaught(ship) else max(0, int(round(hull_rf)))
         air_launch = max(0, int(round(_ship_air_launch_range(ship))))
         air_dmg = _ship_aircraft_strike_damage(ship)
 
         if hull_damage <= 0 and air_dmg <= 0:
             continue
 
-        max_reach = max(
-            move_reach + hull_range,
-            move_reach + air_launch if air_dmg > 0 else 0,
-        )
+        if hull_rf <= 0.0:
+            melee_hull_reach = hull_damage > 0.0
+            max_reach = max(
+                move_reach if melee_hull_reach else 0,
+                move_reach + air_launch if air_dmg > 0 else 0,
+            )
+        else:
+            max_reach = max(
+                move_reach + hull_range,
+                move_reach + air_launch if air_dmg > 0 else 0,
+            )
         for dx in range(-max_reach, max_reach + 1):
             for dy in range(-max_reach, max_reach + 1):
                 manhat = abs(dx) + abs(dy)
@@ -214,8 +230,12 @@ def threat_map_for(game, owner):
                 if not (0 <= tx < board_size and 0 <= ty < board_size):
                     continue
                 contribution = 0.0
-                if hull_damage > 0 and manhat <= move_reach + hull_range:
-                    contribution += hull_damage
+                if hull_damage > 0:
+                    if hull_rf <= 0.0:
+                        if manhat <= move_reach:
+                            contribution += hull_damage
+                    elif manhat <= move_reach + hull_range:
+                        contribution += hull_damage
                 if air_dmg > 0 and manhat <= move_reach + air_launch:
                     contribution += air_dmg
                 if contribution > 0:
@@ -246,6 +266,56 @@ def threat_map_for(game, owner):
     return threats
 
 
+def hull_shots_resting_cap(ship):
+    """Max hull cannon presses per activation (excluding aircraft strikes)."""
+    return 2 if getattr(ship, "ship_type", None) == "Dreadnaught" else 1
+
+
+def ship_is_dreadnaught(attacker_ship):
+    return getattr(attacker_ship, "ship_type", None) == "Dreadnaught"
+
+
+def _generic_hull_geometry(attacker_ship, target_ship):
+    """Hull reach for normal batteries (ignored for Dreadnaught)."""
+    sr = float(getattr(attacker_ship, "range", 0))
+    if sr <= 0.0:
+        return attacker_ship.x == target_ship.x and attacker_ship.y == target_ship.y
+    dist = math.dist((attacker_ship.x, attacker_ship.y), (target_ship.x, target_ship.y))
+    return dist <= sr + 1e-9
+
+
+def hull_geometry_in_range(attacker_ship, target_ship):
+    """Hull battery reach (ignores ammunition)."""
+    if ship_is_dreadnaught(attacker_ship):
+        dist = math.dist((attacker_ship.x, attacker_ship.y), (target_ship.x, target_ship.y))
+        return dist <= 2.0 + 1e-9
+    return _generic_hull_geometry(attacker_ship, target_ship)
+
+
+def dreadnaught_battery_shell_damage(attacker_ship, target_ship):
+    """Single hull shell vs target distance; 0 if out of Euclidean battery arc."""
+    dist = math.dist((attacker_ship.x, attacker_ship.y), (target_ship.x, target_ship.y))
+    if dist <= 1.0 + 1e-9:
+        return 2.0
+    if dist <= 2.0 + 1e-9:
+        return 1.0
+    return 0.0
+
+
+def hull_damage_one_volley(attacker_ship, target_ship):
+    """Damage from one hull FIRE press (excluding aircraft). Used when geometry and shots permit."""
+    if ship_is_dreadnaught(attacker_ship):
+        return dreadnaught_battery_shell_damage(attacker_ship, target_ship)
+    return float(getattr(attacker_ship, "damage", 0)) if _generic_hull_geometry(attacker_ship, target_ship) else 0.0
+
+
+def hull_weapon_hits(attacker_ship, target_ship):
+    """True if hull guns can legally fire at ``target_ship`` this turn."""
+    if getattr(attacker_ship, "shots", 0) <= 0:
+        return False
+    return hull_geometry_in_range(attacker_ship, target_ship)
+
+
 def focus_fire_potential(game, target_ship, attackers_owner):
     """Upper-bound damage `attackers_owner` can deliver to `target_ship` this turn
     from in-place attackers (no movement assumed).
@@ -263,10 +333,15 @@ def focus_fire_potential(game, target_ship, attackers_owner):
         if not _ship_can_threaten(ship):
             continue
         dist = math.dist((ship.x, ship.y), target_pos)
-        hull_range = float(getattr(ship, "range", 0))
         air_launch = _ship_air_launch_range(ship)
-        if hull_range > 0 and dist <= hull_range and getattr(ship, "shots", 0) > 0:
-            total += float(getattr(ship, "damage", 0))
+        if hull_weapon_hits(ship, target_ship):
+            if ship_is_dreadnaught(ship):
+                per = dreadnaught_battery_shell_damage(ship, target_ship)
+                ns = max(0, getattr(ship, "shots", 0))
+                if per > 0:
+                    total += per * ns
+            else:
+                total += float(getattr(ship, "damage", 0))
         if dist <= air_launch:
             total += _ship_aircraft_strike_damage(ship)
 
@@ -349,29 +424,128 @@ def aircraft_dominance(game, owner):
     return total
 
 
-def evaluate_board(game_state):
-    """Returns board score from Player 2 (AI) perspective.
+EVAL_CORE_BAND_CHEB = 1
 
-    Positive score means Player 2 is ahead, negative means Player 1 is ahead.
-    """
-    if getattr(game_state, "game_over", False):
-        if getattr(game_state, "winner", None) == 2:
-            return WIN_SCORE
-        if getattr(game_state, "winner", None) == 1:
-            return -WIN_SCORE
+
+def localized_aircraft_dominance_near_contact(game_state, owner, contact_radius=2):
+    enemy_owner = 1 if owner == 2 else 2
+    enemy_tiles = {
+        (s.x, s.y)
+        for s in game_state.all_ships
+        if s.owner == enemy_owner and not getattr(s, "is_base", False)
+        and not getattr(s, "is_aircraft_counter", False)
+    }
+    if not enemy_tiles:
         return 0.0
+    ally_cells = [
+        (s.x, s.y)
+        for s in game_state.all_ships
+        if s.owner == owner and not getattr(s, "is_base", False)
+        and not getattr(s, "is_aircraft_counter", False)
+    ]
+    if not ally_cells:
+        return 0.0
+    flagged = set()
+    for tx, ty in enemy_tiles:
+        if any(
+            manhattan_distance((tx, ty), (ax, ay)) <= contact_radius for ax, ay in ally_cells
+        ):
+            flagged.add((tx, ty))
+    if not flagged:
+        return 0.0
+    total = 0.0
+    board_size = game_state.board_size
+    for tx, ty in flagged:
+        zone = {(tx, ty)}
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = tx + dx, ty + dy
+            if 0 <= nx < board_size and 0 <= ny < board_size:
+                zone.add((nx, ny))
+        my_air = 0.0
+        their_fighters = 0.0
+        for ship in game_state.all_ships:
+            if (ship.x, ship.y) not in zone:
+                continue
+            if getattr(ship, "is_base", False):
+                continue
+            if ship.owner == owner:
+                my_air += _ship_available_fighters(ship) + _ship_available_bombers(ship)
+            elif ship.owner == enemy_owner:
+                their_fighters += _ship_available_fighters(ship)
+        total += max(0.0, my_air - their_fighters)
+    return total
 
-    score = 0.0
 
-    # 1) Terminal state checks.
-    p1_ships = [s for s in game_state.all_ships if s.owner == 1]
-    p2_ships = [s for s in game_state.all_ships if s.owner == 2]
-    if not p2_ships:
-        return -2000.0
-    if not p1_ships:
-        return 2000.0
+def _enemy_mobile_ships(game_state, owner):
+    return [
+        s
+        for s in game_state.all_ships
+        if s.owner == owner
+        and not getattr(s, "is_base", False)
+        and not getattr(s, "is_aircraft_counter", False)
+    ]
 
-    # Tunables for positional scoring based on current board size.
+
+def _adjacency_inbound_pressure_raw(game_state):
+    raw = 0.0
+    p2m = _enemy_mobile_ships(game_state, 2)
+    p1m = _enemy_mobile_ships(game_state, 1)
+    for ship in p2m:
+        if not any(manhattan_distance((ship.x, ship.y), (e.x, e.y)) <= 1 for e in p1m):
+            continue
+        raw -= focus_fire_potential(game_state, ship, 1)
+    for ship in p1m:
+        if not any(manhattan_distance((ship.x, ship.y), (e.x, e.y)) <= 1 for e in p2m):
+            continue
+        raw += focus_fire_potential(game_state, ship, 2)
+    return raw
+
+
+def _melee_leverage_trade_raw(game_state):
+    p2m = _enemy_mobile_ships(game_state, 2)
+    p1m = _enemy_mobile_ships(game_state, 1)
+    gain = 0.0
+    for ship in p2m:
+        for foe in p1m:
+            if manhattan_distance((ship.x, ship.y), (foe.x, foe.y)) > 1:
+                continue
+            atk = focus_fire_potential(game_state, foe, 2)
+            defn = focus_fire_potential(game_state, ship, 1)
+            gain += max(0.0, atk - defn)
+    loss = 0.0
+    for ship in p1m:
+        for foe in p2m:
+            if manhattan_distance((ship.x, ship.y), (foe.x, foe.y)) > 1:
+                continue
+            atk = focus_fire_potential(game_state, foe, 1)
+            defn = focus_fire_potential(game_state, ship, 2)
+            loss += max(0.0, atk - defn)
+    return gain - loss
+
+
+def _initiative_contested_raw(game_state, contest_radius=2):
+    def side_total(owner):
+        opp = 1 if owner == 2 else 2
+        foes = _enemy_mobile_ships(game_state, opp)
+        heroes = _enemy_mobile_ships(game_state, owner)
+        pts = 0.0
+        for s in heroes:
+            if not any(manhattan_distance((s.x, s.y), (e.x, e.y)) <= contest_radius for e in foes):
+                continue
+            pts += (
+                float(getattr(s, "shots", 0))
+                + _ship_available_fighters(s)
+                + _ship_available_bombers(s)
+            )
+        return pts
+
+    return side_total(2) - side_total(1)
+
+
+def compute_evaluation_features(game_state):
+    """Raw features (Player-2 perspective). Dot with merge_eval_weights(...)."""
+    feats = {k: 0.0 for k in DEFAULT_EVAL_WEIGHTS}
+
     center = (game_state.board_size - 1) / 2.0
     center_cap = max(1.0, game_state.board_size / 2.0)
     turn_number = getattr(game_state, "turn_number", 1)
@@ -380,7 +554,6 @@ def evaluate_board(game_state):
     }
     unbased_planets = [p for p in game_state.planets if p not in base_positions]
 
-    # Fleet mobility penalty: non-destroyers stranded without a destroyer anchor are effectively immobile.
     stack_map = {}
     for ship in game_state.all_ships:
         if getattr(ship, "is_base", False):
@@ -392,56 +565,44 @@ def evaluate_board(game_state):
         locked_non_destroyers = sum(1 for s in stack if s.ship_type not in DESTROYER_TYPES)
         if locked_non_destroyers and not has_destroyer:
             penalty = MOBILITY_LOCK_PENALTY * locked_non_destroyers
-            score += -penalty if owner == 2 else penalty
+            feats["mobility_lock"] += -penalty if owner == 2 else penalty
 
     for ship in game_state.all_ships:
-        multiplier = 1.0 if ship.owner == 2 else -1.0
-
-        # 2) Material value: base cost + survivability.
+        mult = 1.0 if ship.owner == 2 else -1.0
         health_ratio = 0.0 if ship.max_health <= 0 else (ship.hp / ship.max_health)
-        ship_value = float(ship.cost) * 10.0 + (health_ratio * 5.0)
-
-        # 3) ID-aware adjustment so all defined ship IDs influence evaluation.
+        fv = float(ship.cost) * 10.0 + (health_ratio * 5.0)
         ship_type_bonus = SHIP_ID_EVAL_MULTIPLIERS.get(getattr(ship, "ship_type_id", 0), 1.0)
-        ship_value *= ship_type_bonus
+        fv *= ship_type_bonus
 
-        # 4) Bases and scrap economy.
         if getattr(ship, "is_base", False):
-            ship_value += BASE_VALUE_BONUS
-            ship_value += float(getattr(ship, "scrap", 0)) * 3.0
+            fv += BASE_VALUE_BONUS
+            fv += float(getattr(ship, "scrap", 0)) * 3.0
             if is_base_guarded(game_state, ship):
-                ship_value += 18.0
+                fv += 18.0
             else:
-                ship_value -= 22.0
+                fv -= 22.0
             if turn_number <= 10 and (ship.x, ship.y) in game_state.planets:
-                ship_value += EARLY_BASE_EXPANSION_BONUS
+                feats["early_base_on_planet"] += mult * EARLY_BASE_EXPANSION_BONUS
 
-        # 5) Position (center control) on any board size.
-        dist_to_center = abs(ship.x - center) + abs(ship.y - center)
-        center_bonus = max(0.0, center_cap - dist_to_center) * 0.5
-
-        # 6) Charge/hyperdrive pressure.
         if getattr(ship, "is_charged", False):
-            ship_value += 3.0
+            feats["charge_pressure"] += mult * 3.0
         elif getattr(ship, "is_charging", False):
-            ship_value += 1.0
+            feats["charge_pressure"] += mult * 1.0
 
-        # 7) Dreadnaught kiting and danger from light ships.
         if ship.ship_type == "Dreadnaught":
             enemies = [
                 e for e in game_state.all_ships
                 if e.owner != ship.owner and not getattr(e, "is_base", False)
             ]
             if any(manhattan_distance((ship.x, ship.y), (e.x, e.y)) == 2 for e in enemies):
-                ship_value += DREAD_KITING_BONUS
+                feats["dread_kiting"] += mult * DREAD_KITING_BONUS
             if any(
                 e.ship_type in LIGHT_SHIP_TYPES
                 and manhattan_distance((ship.x, ship.y), (e.x, e.y)) <= 3
                 for e in enemies
             ):
-                ship_value -= DREAD_LIGHT_THREAT_PENALTY
+                feats["dread_light_threat"] += mult * (-DREAD_LIGHT_THREAT_PENALTY)
 
-        # 8) Early economy expansion pressure toward open planets.
         if (
             turn_number <= 10
             and not getattr(ship, "is_base", False)
@@ -451,12 +612,23 @@ def evaluate_board(game_state):
             nearest_open_planet = min(
                 manhattan_distance((ship.x, ship.y), planet) for planet in unbased_planets
             )
-            ship_value += max(0.0, 4 - nearest_open_planet) * EARLY_PLANET_PRESSURE_BONUS
+            feats["early_planet_pressure"] += mult * (
+                max(0.0, 4 - nearest_open_planet) * EARLY_PLANET_PRESSURE_BONUS
+            )
 
-        score += (ship_value + center_bonus) * multiplier
+        feats["fleet_material_core"] += fv * mult
 
-    # 9) Threat balance: reward squares we threaten on enemy ships and penalize
-    #    squares of ours under enemy threat.
+        dist_to_center = abs(ship.x - center) + abs(ship.y - center)
+        feats["center_manhattan_units"] += mult * max(0.0, center_cap - dist_to_center)
+
+        if (
+            not getattr(ship, "is_base", False)
+            and not getattr(ship, "is_aircraft_counter", False)
+        ):
+            cheb = max(abs(ship.x - center), abs(ship.y - center))
+            if cheb <= EVAL_CORE_BAND_CHEB:
+                feats["core_band_occupancy"] += mult * 1.0
+
     p2_threats = threat_map_for(game_state, 2)
     p1_threats = threat_map_for(game_state, 1)
     threat_balance = 0.0
@@ -468,45 +640,74 @@ def evaluate_board(game_state):
             threat_balance += p2_threats.get(pos, 0.0)
         elif ship.owner == 2:
             threat_balance -= p1_threats.get(pos, 0.0)
-    score += threat_balance * THREAT_BALANCE_WEIGHT
+    feats["threat_balance"] = threat_balance
 
-    # 10) Focus-fire kill detection (mirrored for both sides).
     for enemy in (s for s in game_state.all_ships if s.owner == 1):
         if focus_fire_potential(game_state, enemy, 2) >= getattr(enemy, "hp", 0) - 1e-9:
             if getattr(enemy, "is_base", False):
                 if not is_base_guarded(game_state, enemy):
-                    score += FOCUS_FIRE_BASE_BONUS
+                    feats["focus_fire_base"] += FOCUS_FIRE_BASE_BONUS
             else:
-                score += FOCUS_FIRE_KILL_BONUS
+                feats["focus_fire_kill"] += FOCUS_FIRE_KILL_BONUS
     for friendly in (s for s in game_state.all_ships if s.owner == 2):
         if focus_fire_potential(game_state, friendly, 1) >= getattr(friendly, "hp", 0) - 1e-9:
             if getattr(friendly, "is_base", False):
                 if not is_base_guarded(game_state, friendly):
-                    score -= FOCUS_FIRE_BASE_BONUS
+                    feats["focus_fire_base"] -= FOCUS_FIRE_BASE_BONUS
             else:
-                score -= FOCUS_FIRE_KILL_BONUS
+                feats["focus_fire_kill"] -= FOCUS_FIRE_KILL_BONUS
 
-    # 11) Base safety (mirrored for both sides).
     for base_ship in (s for s in game_state.all_ships if getattr(s, "is_base", False)):
         safety = base_safety_score(game_state, base_ship)
         if safety is None:
             continue
-        side_multiplier = 1.0 if base_ship.owner == 2 else -1.0
-        local_score = 0.0
+        side_mult = 1.0 if base_ship.owner == 2 else -1.0
         if safety["guarded"]:
-            local_score += BASE_GUARD_BONUS
+            feats["base_guard"] += side_mult * BASE_GUARD_BONUS
         else:
-            local_score -= BASE_UNGUARDED_PENALTY
+            feats["base_unguarded"] += side_mult * (-BASE_UNGUARDED_PENALTY)
         if safety["enemy_charged_threat"]:
-            local_score -= BASE_HYPER_THREAT_PENALTY
-        local_score += min(safety["defender_hp"] * 2.0, DEFENDER_HP_BONUS_CAP)
-        score += local_score * side_multiplier
+            feats["base_hyper_threat"] += side_mult * (-BASE_HYPER_THREAT_PENALTY)
+        feats["base_defender_hp_term"] += side_mult * min(
+            safety["defender_hp"] * 2.0,
+            DEFENDER_HP_BONUS_CAP,
+        )
 
-    # 12) Aircraft dominance: bonus for outpacing enemy fighters in their dogfight zones.
-    score += AIRCRAFT_DOMINANCE_WEIGHT * aircraft_dominance(game_state, 2)
-    score -= AIRCRAFT_DOMINANCE_WEIGHT * aircraft_dominance(game_state, 1)
+    feats["aircraft_dominance"] = aircraft_dominance(game_state, 2) - aircraft_dominance(
+        game_state, 1
+    )
 
-    return score
+    la2 = localized_aircraft_dominance_near_contact(game_state, 2, contact_radius=2)
+    la1 = localized_aircraft_dominance_near_contact(game_state, 1, contact_radius=2)
+    feats["cqb_local_air"] = la2 - la1
+    feats["cqb_adjacent_pressure"] = _adjacency_inbound_pressure_raw(game_state)
+    feats["cqb_melee_leverage"] = _melee_leverage_trade_raw(game_state)
+    feats["cqb_initiative"] = _initiative_contested_raw(game_state)
+
+    return feats
+
+
+def evaluate_board(game_state, eval_weights_overlay=None):
+    """Returns board score from Player 2 (AI) perspective.
+
+    Positive score means Player 2 is ahead, negative means Player 1 is ahead.
+    """
+    if getattr(game_state, "game_over", False):
+        if getattr(game_state, "winner", None) == 2:
+            return WIN_SCORE
+        if getattr(game_state, "winner", None) == 1:
+            return -WIN_SCORE
+        return 0.0
+
+    p1_ships = [s for s in game_state.all_ships if s.owner == 1]
+    p2_ships = [s for s in game_state.all_ships if s.owner == 2]
+    if not p2_ships:
+        return -2000.0
+    if not p1_ships:
+        return 2000.0
+
+    merged = merge_eval_weights(eval_weights_overlay)
+    return score_from_features(compute_evaluation_features(game_state), merged)
 
 # Hangar buys add +1 fighter/bomber to the ship at this base tile with highest aircraft_storage.
 HANGAR_FIGHTER_KEY = "__HANGAR_FIGHTER__"
@@ -528,7 +729,7 @@ SCENARIO_POOL = [
 FIGHTER_STRIKE_DAMAGE = SHIP_TEMPLATES["Fighter"]["damage"]
 BOMBER_STRIKE_DAMAGE = SHIP_TEMPLATES["Bomber"]["damage"]
 
-HYPERDRIVE_MAX_STEPS = 8
+HYPERDRIVE_MAX_STEPS = 4
 _HYPER_KEY_TO_VEC = {"w": (0, -1), "a": (-1, 0), "s": (0, 1), "d": (1, 0)}
 _HYPER_VEC_TO_KEY = {(0, -1): "w", (-1, 0): "a", (0, 1): "s", (1, 0): "d"}
 
@@ -639,7 +840,10 @@ class Ship:
         self.pending_bomber_strikes = 0
         self.pending_fighter_strikes = 0
         self.pending_air_center = None
-        self.shots = 1 if not just_built else 0
+        if ship_type == "Dreadnaught":
+            self.shots = 2 if not just_built else 0
+        else:
+            self.shots = 1 if not just_built else 0
         if just_built:
             self.has_fired = True
 
@@ -661,6 +865,7 @@ class GameState:
         self.turn_number = 1
         self.game_over = False
         self.winner = None
+        self.build_anchor_base_id = None
         self.setup_board(seed=self.tuning_seed)
         self.next_ship_id = max((s.id for s in self.all_ships), default=-1) + 1
         for ship in self.all_ships:
@@ -680,8 +885,33 @@ class GameState:
             bottom_y = (self.board_size - 1) - py
             mirrored_x = (self.board_size - 1) - px
             self.planets.append((mirrored_x, bottom_y))
-            
+
         # Each side starts as one stacked fleet of Cruiser + 2 Destroyers.
+        # Anchor fleets so they begin the same distance from their nearest
+        # "first" planet: use the first generated top-hemisphere planet column
+        # for P1, and its mirrored column for P2.
+        if self.planets:
+            # First entry in `planets` is always a top-hemisphere planet from the loop above.
+            first_top_px, first_top_py = self.planets[0]
+            p1_anchor_x = first_top_px
+        else:
+            p1_anchor_x = self.board_size // 2
+        p1_anchor = (p1_anchor_x, 0)
+        p2_anchor = ((self.board_size - 1) - p1_anchor_x, self.board_size - 1)
+        starting_pack = ("Cruiser", "Destroyer", "Destroyer")
+        sid = 0
+        for ship_type in starting_pack:
+            self.all_ships.append(Ship(p1_anchor[0], p1_anchor[1], 1, sid, ship_type=ship_type))
+            sid += 1
+            self.all_ships.append(Ship(p2_anchor[0], p2_anchor[1], 2, sid, ship_type=ship_type))
+            sid += 1
+
+    def _setup_skirmish_start(self, seed=None):
+        """Symmetric 5×5-style opener: planets + Cruiser stack at mid column ends."""
+        if seed is not None:
+            random.seed(seed)
+        self.all_ships = []
+        self.planets = [(1, 1), (3, 3), (0, 2)]
         p1_anchor = (self.board_size // 2, 0)
         p2_anchor = (self.board_size // 2, self.board_size - 1)
         starting_pack = ("Cruiser", "Destroyer", "Destroyer")
@@ -692,8 +922,8 @@ class GameState:
             self.all_ships.append(Ship(p2_anchor[0], p2_anchor[1], 2, sid, ship_type=ship_type))
             sid += 1
 
-    def reset_match(self, deterministic=False):
-        self.board_size = 10
+    def reset_match(self, deterministic=False, board_size=None, skirmish_layout=False):
+        self.board_size = 10 if board_size is None else int(board_size)
         self.ai_vs_ai = False
         self.active_player = 1
         self.state_history = []
@@ -703,7 +933,12 @@ class GameState:
         self.turn_number = 1
         self.game_over = False
         self.winner = None
-        self.setup_board(seed=self.tuning_seed if deterministic else None)
+        self.build_anchor_base_id = None
+        seed = self.tuning_seed if deterministic else None
+        if skirmish_layout and self.board_size == 5:
+            self._setup_skirmish_start(seed=seed)
+        else:
+            self.setup_board(seed=seed)
         self.next_ship_id = max((s.id for s in self.all_ships), default=-1) + 1
         for ship in self.all_ships:
             ship.is_selected = False
@@ -711,7 +946,7 @@ class GameState:
             ship.is_turn = (ship.owner == self.active_player)
             ship.has_moved = False
             ship.has_fired = False
-            ship.shots = 1
+            ship.shots = hull_shots_resting_cap(ship)
             ship.did_move_this_turn = False
             ship.did_dogfight_this_turn = False
             ship.did_hyperdrive_this_turn = False
@@ -813,7 +1048,7 @@ class GameState:
             ship.is_turn = (ship.owner == self.active_player)
             ship.has_moved = False
             ship.has_fired = False
-            ship.shots = 1
+            ship.shots = hull_shots_resting_cap(ship)
             ship.did_move_this_turn = False
             ship.did_dogfight_this_turn = False
             ship.did_hyperdrive_this_turn = False
@@ -858,14 +1093,99 @@ class GameState:
             return False
         return True
 
+    def _neighbor_hangar_recipients_for_aircraft(self, x, y, owner, excluded_ids):
+        """Ortho-adjacent friendly hulls that can absorb at least one stored plane."""
+        out = []
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < self.board_size and 0 <= ny < self.board_size):
+                continue
+            for s in self.all_ships:
+                if s.hp <= 0 or s.id in excluded_ids:
+                    continue
+                if s.x != nx or s.y != ny or s.owner != owner:
+                    continue
+                if getattr(s, "is_aircraft_counter", False) or getattr(s, "is_base", False):
+                    continue
+                if aircraft_carrying_capacity_int(s) < 1 or aircraft_hangar_space(s) < 1:
+                    continue
+                out.append(s)
+        out.sort(key=lambda q: (-aircraft_hangar_space(q), -aircraft_carrying_capacity_int(q), q.id))
+        return out
+
+    def _redirect_hangar_aircraft(self, doomed, doomed_and_peer_ids):
+        """Fighters evacuate before bombers; planes without adjacent hangar capacity are lost."""
+        if getattr(doomed, "is_base", False) or getattr(doomed, "is_aircraft_counter", False):
+            return
+        fl = max(0, self._available_fighters(doomed))
+        bl = max(0, self._available_bombers(doomed))
+        if fl == 0 and bl == 0:
+            return
+        receivers = self._neighbor_hangar_recipients_for_aircraft(doomed.x, doomed.y, doomed.owner, doomed_and_peer_ids)
+        rescued_f = rescued_b = lost_f = lost_b = 0
+        while fl > 0:
+            receivers.sort(key=lambda q: (-aircraft_hangar_space(q), q.id))
+            recv = next((r for r in receivers if aircraft_hangar_space(r) >= 1), None)
+            if recv is None:
+                lost_f += fl
+                break
+            recv.fighters = int(recv.fighters) + 1
+            fl -= 1
+            rescued_f += 1
+        while bl > 0:
+            receivers.sort(key=lambda q: (-aircraft_hangar_space(q), q.id))
+            recv = next((r for r in receivers if aircraft_hangar_space(r) >= 1), None)
+            if recv is None:
+                lost_b += bl
+                break
+            recv.bombers = int(recv.bombers) + 1
+            bl -= 1
+            rescued_b += 1
+        if rescued_f or rescued_b or lost_f or lost_b:
+            self.action_log.append(
+                f"Scramble from sunk {doomed.ship_type}: +{rescued_f} fighters, +{rescued_b} bombers evacuated; "
+                f"{lost_f} fighters and {lost_b} bombers had no adjacent hangar."
+            )
+
     def _cleanup_destroyed_ships(self):
         destroyed = [s for s in self.all_ships if s.hp <= 0]
         if not destroyed:
             return
-        destroyed_bases = [s for s in destroyed if getattr(s, "is_base", False)]
+        destroy_ids = {s.id for s in destroyed}
+
+        enemy_sel_meta = None
+        for ship in self.all_ships:
+            if getattr(ship, "is_enemy_selected", False):
+                enemy_sel_meta = (ship.x, ship.y, ship.owner, ship.id)
+                break
+
+        destroyed_bases_meta = [s for s in destroyed if getattr(s, "is_base", False)]
+
+        for d in destroyed:
+            self._redirect_hangar_aircraft(d, destroy_ids)
+
         self.all_ships = [s for s in self.all_ships if s.hp > 0]
-        if destroyed_bases and not self.game_over:
-            blown_base = destroyed_bases[0]
+
+        if enemy_sel_meta is not None:
+            ex, ey, eowner, eid = enemy_sel_meta
+            if eid in destroy_ids:
+                mates = sorted(
+                    [
+                        s
+                        for s in self.all_ships
+                        if s.x == ex and s.y == ey and s.owner == eowner
+                        and not getattr(s, "is_aircraft_counter", False)
+                    ],
+                    key=lambda m: m.id,
+                )
+                for ship in self.all_ships:
+                    ship.is_enemy_selected = False
+                pick = mates[0] if mates else None
+                if pick is not None:
+                    pick.is_enemy_selected = True
+
+        if destroyed_bases_meta and not self.game_over:
+            blown_base = destroyed_bases_meta[0]
             self.game_over = True
             self.winner = 2 if blown_base.owner == 1 else 1
             self.action_log.append(
@@ -987,6 +1307,7 @@ class GameState:
             "winner": self.winner,
             "next_ship_id": self.next_ship_id,
             "build_menu_open": self.build_menu_open,
+            "build_anchor_base_id": getattr(self, "build_anchor_base_id", None),
             "board_size": self.board_size,
             "ai_vs_ai": getattr(self, "ai_vs_ai", False),
         }
@@ -1004,6 +1325,7 @@ class GameState:
                 self.winner = state.get("winner")
                 self.next_ship_id = state.get("next_ship_id", self.next_ship_id)
                 self.build_menu_open = state.get("build_menu_open", False)
+                self.build_anchor_base_id = state.get("build_anchor_base_id")
                 self.board_size = state.get("board_size", 10)
                 self.ai_vs_ai = state.get("ai_vs_ai", False)
                 self.action_log = ["Turn reset to start state."]
@@ -1021,6 +1343,7 @@ class GameState:
             self.winner = state.get("winner")
             self.next_ship_id = state.get("next_ship_id", self.next_ship_id)
             self.build_menu_open = state.get("build_menu_open", False)
+            self.build_anchor_base_id = state.get("build_anchor_base_id")
             self.board_size = state.get("board_size", 10)
             self.ai_vs_ai = state.get("ai_vs_ai", False)
 
@@ -1061,7 +1384,7 @@ class GameState:
                 s.is_charging = False
             s.has_moved = False
             s.has_fired = False
-            s.shots = 1
+            s.shots = hull_shots_resting_cap(s)
             s.did_move_this_turn = False
             s.did_dogfight_this_turn = False
             s.did_hyperdrive_this_turn = False
@@ -1075,6 +1398,7 @@ class GameState:
             s.hyperdrive_dy = None
             s.hyperdrive_steps_used = 0
         self.build_menu_open = False
+        self.build_anchor_base_id = None
         self._assign_move_budgets_for_turn_start()
         self.save_state("Start of Turn")
 
@@ -1245,6 +1569,8 @@ class GameState:
         incoming_ids = {s.id for s in move_group}
         if (nx, ny) == (ship.x, ship.y):
             if steps_used == 0:
+                ship.hyperdrive_dx = ship.hyperdrive_dy = None
+                self._fleet_broadcast_hyper_metadata(ship, move_group)
                 self.action_log = ["Hyperdrive blocked by map edge."]
                 return
             self._finalize_hyperdrive_glide(move_group, consumed_action=True)
@@ -1261,6 +1587,22 @@ class GameState:
             ),
             None,
         )
+        planet_block = (nx, ny) in self.planets
+
+        if blocker is not None or planet_block:
+            if steps_used == 0:
+                ship.hyperdrive_dx = ship.hyperdrive_dy = None
+                self._fleet_broadcast_hyper_metadata(ship, move_group)
+                self.action_log = [
+                    "Hyperdrive blocked: planet or obstacle in next square; stayed in place.",
+                ]
+                return
+            self._finalize_hyperdrive_glide(move_group, consumed_action=True)
+            reason = "planet" if planet_block else "obstacle"
+            self.action_log = [
+                f"Hyperdrive stopped short before {reason} after {steps_used} step(s); holding ({ship.x},{ship.y}).",
+            ]
+            return
 
         for mover in move_group:
             mover.x = nx
@@ -1273,19 +1615,11 @@ class GameState:
             self.try_spawn_base_on_planet(mover)
 
         stepped = ship.hyperdrive_steps_used
-        hit_planet = (ship.x, ship.y) in self.planets
-        done = blocker is not None or hit_planet or stepped >= HYPERDRIVE_MAX_STEPS
+        done = stepped >= HYPERDRIVE_MAX_STEPS
 
         if done:
             self._finalize_hyperdrive_glide(move_group, consumed_action=True)
-            if stepped >= HYPERDRIVE_MAX_STEPS:
-                why = "max range"
-            elif hit_planet:
-                why = "planet"
-            elif blocker is not None:
-                why = "collision"
-            else:
-                why = "stopped"
+            why = "max range"
             self.action_log = [
                 f"Hyperdrive ({why}): {stepped} step(s) → ({ship.x},{ship.y})",
             ]
@@ -1294,18 +1628,39 @@ class GameState:
                 f"Hyperdrive step {stepped}/{HYPERDRIVE_MAX_STEPS} → ({ship.x},{ship.y}); repeat [{key.upper()}] or C to stop.",
             ]
 
+    def base_for_build_commands(self):
+        """Return the allied base granting builds for the current selection (base tile or docked fleet)."""
+        sel = next((s for s in self.all_ships if getattr(s, "is_selected", False)), None)
+        if sel is None:
+            return None
+        if sel.owner != self.active_player:
+            return None
+        if getattr(sel, "is_base", False):
+            return sel
+        b = self.base_at(sel.x, sel.y)
+        if b is not None and b.owner == sel.owner:
+            return b
+        return None
+
     def toggle_build_menu(self):
         if self.game_over:
             self.action_log = [f"Game over. Player {self.winner} wins. Press G for new match."]
             return
-        sel = next((s for s in self.all_ships if s.is_selected), None)
-        if sel and getattr(sel, "is_base", False):
-            self.build_menu_open = not self.build_menu_open
-            status = "open" if self.build_menu_open else "closed"
-            self.action_log = [f"Build menu {status} (scrap: {sel.scrap})"]
-        else:
+        base_ship = self.base_for_build_commands()
+        if base_ship is None:
             self.build_menu_open = False
-            self.action_log = ["Select a base to open build menu (B)."]
+            self.build_anchor_base_id = None
+            self.action_log = [
+                "B: Select one of your ships on a planet with a base — or select the base — to open builds.",
+            ]
+            return
+        self.build_menu_open = not self.build_menu_open
+        if self.build_menu_open:
+            self.build_anchor_base_id = base_ship.id
+            self.action_log = [f"Build menu open — scrap {base_ship.scrap:g} (base hull #{base_ship.id})."]
+        else:
+            self.build_anchor_base_id = None
+            self.action_log = ["Build menu closed."]
 
     def try_build_ship(self, slot_index_one_based):
         if self.game_over:
@@ -1313,9 +1668,24 @@ class GameState:
             return
         if not self.build_menu_open:
             return
-        base = next((s for s in self.all_ships if s.is_selected and getattr(s, "is_base", False)), None)
+        base = None
+        if getattr(self, "build_anchor_base_id", None) is not None:
+            base = next(
+                (
+                    s
+                    for s in self.all_ships
+                    if s.id == self.build_anchor_base_id
+                    and getattr(s, "is_base", False)
+                    and s.hp > 0
+                ),
+                None,
+            )
+        if base is None:
+            base = self.base_for_build_commands()
         if not base or base.owner != self.active_player:
-            self.action_log = ["Must select your base to build."]
+            self.action_log = [
+                "Build denied: reopen the menu with B while a docked fleet or the base planet is selected.",
+            ]
             return
         idx = slot_index_one_based - 1
         if not (0 <= idx < len(BUILD_MENU_ORDER)):
@@ -1338,6 +1708,7 @@ class GameState:
                 f"{aircraft_aircraft_stored_total(recipient)}/{aircraft_carrying_capacity_int(recipient)}).",
             ]
             self.build_menu_open = False
+            self.build_anchor_base_id = None
             self._assign_move_budgets_for_turn_start()
             return
         if entry == HANGAR_BOMBER_KEY:
@@ -1357,6 +1728,7 @@ class GameState:
                 f"{aircraft_aircraft_stored_total(recipient)}/{aircraft_carrying_capacity_int(recipient)}).",
             ]
             self.build_menu_open = False
+            self.build_anchor_base_id = None
             self._assign_move_budgets_for_turn_start()
             return
 
@@ -1387,6 +1759,7 @@ class GameState:
         self.all_ships.append(new_ship)
         self.action_log = [f"Built {ship_type} at ({base.x},{base.y}); cannot attack until next activation."]
         self.build_menu_open = False
+        self.build_anchor_base_id = None
         self._assign_move_budgets_for_turn_start()
 
     def update_stats(self, ship, target_ship, key, prev_key):
@@ -1458,14 +1831,9 @@ class GameState:
             if getattr(ship, "just_built", False):
                 self.action_log = ["New ships cannot fire until your next activation."]
                 return
-            peer_stack = mobile_ships_at(self, ship.x, ship.y, ship.owner)
-            if any(getattr(s, "did_hyperdrive_this_turn", False) for s in peer_stack):
-                self.action_log.append("Cannot attack this turn after using hyperdrive (same fleet).")
-                return
 
-        # Trace logic for the lower right UI box
+        # Player-facing HUD: keep concise action lines (no fleet debug graph).
         self.action_log = []
-        self.action_log.append(f"UpdateStats(Ship {ship.id}, Key: {key})")
         self.save_state("Pre-Action")
 
         # Update Fleet List (mobile allies on same tile; bases stay docked)
@@ -1480,8 +1848,6 @@ class GameState:
         if ship.fleet_num != ship.start_fleet_num:
             ship.is_reorganizing = True
             for f_ship in ship.fleet_list: f_ship.is_reorganizing = True
-
-        self.action_log.append(f"isTurn: {ship.is_turn} -> isFleeted: {ship.is_fleeted} -> Reorganizing: {ship.is_reorganizing}")
 
         # Movement: mobiles move together; light-only stacks budget 2, mixed stacks 1 step/turn pool.
         if key in ['w', 'a', 's', 'd']:
@@ -1527,14 +1893,17 @@ class GameState:
 
         # Firing Logic
         if key == 'f' and target_ship:
+            etyp = getattr(target_ship, "ship_type", "?")
             if not self.can_target_ship(target_ship):
-                self.action_log.append("Action F: Base is protected by a guarding fleet")
+                self.action_log.append(
+                    f"F: {ship.ship_type} selected vs {etyp}, but guarded bases cannot be attacked until defenders leave.",
+                )
                 return
             dist = math.sqrt((ship.x - target_ship.x) ** 2 + (ship.y - target_ship.y) ** 2)
             ship_range = float(ship.range)
             aircraft_launch_range = 2.0 if ship_range <= 0.0 else max(1.0, ship_range)
             in_air_range = dist <= aircraft_launch_range
-            in_hull_range = ship_range > 0.0 and dist <= ship_range
+            in_hull_range = hull_geometry_in_range(ship, target_ship)
 
             zone_tiles = set(self._dogfight_tiles(target_ship.x, target_ship.y))
             attacker_zone = [
@@ -1559,46 +1928,91 @@ class GameState:
             pending_center = getattr(ship, "pending_air_center", None)
 
             if pending_aircraft > 0:
+                strike = "bomber" if ship.pending_bomber_strikes > 0 else "fighter"
                 if pending_center is None or not self._is_in_dogfight_space(pending_center, target_ship):
-                    self.action_log.append("Action F: Select an enemy in the active dogfight space")
+                    self.action_log.append(
+                        f"F: {strike} ripple active — choose an enemy tile touching that dogfight footprint (vs {etyp}).",
+                    )
                     return
                 if ship.pending_bomber_strikes > 0:
                     ship.pending_bomber_strikes -= 1
                     target_ship.hp -= BOMBER_STRIKE_DAMAGE
                     self.attack_damage_done_this_turn = True
-                    self.action_log.append(f"Air strike: bomber hit ({BOMBER_STRIKE_DAMAGE})")
+                    self.action_log.append(
+                        f"F: {ship.ship_type} bomber sortie hits {etyp} for {BOMBER_STRIKE_DAMAGE}.",
+                    )
                 else:
                     ship.pending_fighter_strikes -= 1
                     target_ship.hp -= FIGHTER_STRIKE_DAMAGE
                     self.attack_damage_done_this_turn = True
-                    self.action_log.append(f"Air strike: fighter hit ({FIGHTER_STRIKE_DAMAGE})")
+                    self.action_log.append(
+                        f"F: {ship.ship_type} fighter sortie scratches {etyp} for {FIGHTER_STRIKE_DAMAGE}.",
+                    )
                 if ship.pending_bomber_strikes <= 0 and ship.pending_fighter_strikes <= 0:
                     ship.pending_air_center = None
                 self._cleanup_destroyed_ships()
                 return
 
             if can_dogfight:
+                self.action_log.append(
+                    f"F: {ship.ship_type} commits hangar strikes against {etyp} ({attacker_aircraft} ready craft in melee zone).",
+                )
                 self._resolve_air_dogfight(ship, target_ship)
                 ship.did_dogfight_this_turn = True
                 return
 
             if in_hull_range and ship.shots > 0:
-                target_ship.hp -= ship.damage
+                shell = hull_damage_one_volley(ship, target_ship)
+                if shell <= 1e-9:
+                    self.action_log.append(
+                        f"F: {ship.ship_type} hull cannot square a shell on {etyp} (geometry / distance mismatch).",
+                    )
+                    return
+                target_ship.hp -= shell
                 self.attack_damage_done_this_turn = True
-                ship.has_fired = True
                 ship.shots -= 1
-                self.action_log.append("Action: Fired at enemy!")
+                if ship.shots <= 0:
+                    ship.has_fired = True
+                self.action_log.append(
+                    f"F: {ship.ship_type} main battery hits {etyp} for {shell:g}. "
+                    f"Hull salvos remaining: {ship.shots}.",
+                )
                 self._cleanup_destroyed_ships()
                 return
 
-            if ship.shots <= 0:
-                self.action_log.append("Action F: No shots left this turn")
-            elif attacker_aircraft > 0 and not in_air_range and not in_hull_range:
-                self.action_log.append("Action F: Target out of range")
-            elif ship_range <= 0 and attacker_aircraft == 0:
-                self.action_log.append("Ship cannot fire (no aircraft, no guns).")
+            pending_summary = ""
+            if ship.pending_bomber_strikes or ship.pending_fighter_strikes:
+                pending_summary = (
+                    " Finish resolving pending bomber/fighter strikes before starting a new weapon profile."
+                )
+            elif getattr(ship, "did_dogfight_this_turn", False):
+                pending_summary = " Hangar strike already coordinated this impulse."
+
+            if ship.shots <= 0 and attacker_aircraft <= 0:
+                self.action_log.append(
+                    f"F: {ship.ship_type} has no hull rounds or hangar planes left versus {etyp}.{pending_summary}"
+                )
+            elif attacker_aircraft > 0 and not in_air_range:
+                self.action_log.append(
+                    f"F: Fighters/Bombers need the carrier closer — {ship.ship_type} is out of launcher range of {etyp}.",
+                )
+            elif attacker_aircraft == 0 and ship.shots > 0 and not in_hull_range:
+                self.action_log.append(
+                    f"F: {ship.ship_type} has gun solutions remaining but {etyp} is outside cannon arc.",
+                )
+            elif attacker_aircraft > 0 and in_air_range and not can_dogfight:
+                self.action_log.append(
+                    f"F: Stored craft must sit inside {etyp}'s dogfight tile — slide friendlies adjacent to them first.",
+                )
+            elif ship_range <= 0.0 and attacker_aircraft == 0:
+                hint = (
+                    f"F: Same-tile cannons required to engage {etyp}."
+                    if ship.shots > 0 and not hull_geometry_in_range(ship, target_ship)
+                    else f"F: {ship.ship_type} needs hangar craft or turrets."
+                )
+                self.action_log.append(hint + pending_summary)
             else:
-                self.action_log.append("Action F: Target out of range")
+                self.action_log.append(f"F: No legal shot versus {etyp} right now.{pending_summary}")
 
         # Charge Logic
         if key == 'c' and not ship.is_charging:
@@ -1629,7 +2043,7 @@ class GameState:
             return
 
         mobile_peers = mobile_ships_at(self, ship.x, ship.y, ship.owner)
-        self.action_log = [f"BreakFleetMove(Ship {ship.id}, Key: {key})"]
+        self.action_log = []
         self.save_state("Pre-Action")
 
         has_destroyer_in_stack = any(s.ship_type in DESTROYER_TYPES for s in mobile_peers)

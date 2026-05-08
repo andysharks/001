@@ -1,14 +1,28 @@
+import argparse
 import pygame
 import sys
 from game_ai import AIController
 from game_logic import GameState
-from game_graphics import Renderer
+from game_graphics import Renderer, VISUAL_THEME_COUNT
+from eval_weights import load_eval_weights_file
 
 def main():
+    parser = argparse.ArgumentParser(description="Naval tactical game UI")
+    parser.add_argument(
+        "--eval-weights",
+        default=None,
+        metavar="PATH",
+        help="JSON file with eval_weights (merged atop defaults and config/eval_weights.default.json).",
+    )
+    argv = [a for a in sys.argv[1:] if not a.startswith("-psn")]  # macOS Finder
+    args, pygame_argv = parser.parse_known_args()
+    sys.argv = [sys.argv[0]] + pygame_argv
+
+    eval_w = load_eval_weights_file(args.eval_weights)
     game = GameState()
     renderer = Renderer()
     clock = pygame.time.Clock()
-    ai = AIController(owner=2, depth=4, min_depth=3)
+    ai = AIController(owner=2, depth=4, min_depth=3, eval_weights_overlay=eval_w)
     ai_enabled = False
     ai_step_timer_ms = 0
     ai_step_delay_ms = 250
@@ -62,7 +76,14 @@ def main():
             if event.type == pygame.KEYDOWN:
                 char = event.unicode.lower()
 
-                if game.game_over and char != 'g':
+                if char == "z":
+                    renderer.cycle_board_visual_theme()
+                    game.action_log.append(
+                        f"Board look ({renderer.board_visual_theme + 1}/{VISUAL_THEME_COUNT}): "
+                        f"{renderer.visual_theme_name}"
+                    )
+
+                elif game.game_over and char != 'g':
                     game.action_log = [f"Game over. Player {game.winner} wins. Press G for new match."]
                 elif char == 'o':
                     ai_enabled = not ai_enabled
@@ -159,7 +180,12 @@ def main():
                             ],
                             key=lambda v: (1 if getattr(v, "is_base", False) else 0, v.id),
                         )
-                        if len(fleet) > 1:
+                        if target not in fleet:
+                            for s in game.all_ships:
+                                s.is_enemy_selected = False
+                            if fleet:
+                                fleet[0].is_enemy_selected = True
+                        elif len(fleet) > 1:
                             idx = fleet.index(target)
                             target.is_enemy_selected = False
                             fleet[(idx + 1) % len(fleet)].is_enemy_selected = True
