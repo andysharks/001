@@ -38,6 +38,7 @@ class AIController:
     MODERATE_SWING_THRESHOLD = 20.0
     DECISIVE_SWING_THRESHOLD = 60.0
     KILL_SWING_BONUS = 10.0
+    SCRAP_SPREADING_THRESHOLD = 5.0
 
     def __init__(
         self,
@@ -861,6 +862,24 @@ class AIController:
                 delta += hp - after_hp
         return max(0.0, delta)
 
+    def _get_scrap_advantage(self, game, owner):
+        """Calculate the scrap advantage of the AI side vs enemy side.
+        
+        Positive means AI has more scrap accumulated than enemy.
+        """
+        enemy_owner = 1 if owner == 2 else 2
+        ai_scrap = sum(
+            float(getattr(s, "scrap", 0.0))
+            for s in game.all_ships
+            if s.owner == owner and getattr(s, "is_base", False)
+        )
+        enemy_scrap = sum(
+            float(getattr(s, "scrap", 0.0))
+            for s in game.all_ships
+            if s.owner == enemy_owner and getattr(s, "is_base", False)
+        )
+        return ai_scrap - enemy_scrap
+
     def _build_priority(self, game, owner, menu_entry):
         features = self._build_features(game, owner, menu_entry)
         return score_build_features(features, self._build_weights)
@@ -1156,6 +1175,12 @@ class AIController:
             and not s.has_moved
         ]
 
+        # Check if AI has significant scrap advantage to encourage aggressive spreading
+        scrap_advantage = self._get_scrap_advantage(game, self.owner)
+        scrap_spreading_bonus = 0.0
+        if scrap_advantage >= self.SCRAP_SPREADING_THRESHOLD:
+            scrap_spreading_bonus = (scrap_advantage - self.SCRAP_SPREADING_THRESHOLD) * 500.0
+
         for ship in charged_ships:
             for key in "wasd":
                 if not self._can_step(ship.x, ship.y, key, game.board_size):
@@ -1217,6 +1242,10 @@ class AIController:
                 else:
                     plan = list(plan_hyper) + [("end",)]
                     score = self._owner_score(sim, self.owner)
+                
+                # Add scrap spreading bonus when advantage exists
+                score += scrap_spreading_bonus
+                
                 if score > best_score:
                     best_score = score
                     best_plan = plan
